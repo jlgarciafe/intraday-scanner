@@ -1,7 +1,22 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
-  INTRADAY MOMENTUM SCANNER v3
-  Fix: yfinance v0.2+ returns MultiIndex columns — now handled correctly.
+  INTRADAY MOMENTUM SCANNER v4 — Dynamic Universe
+  
+  Architecture:
+    Stage 1 — Fetch full index constituents dynamically (Wikipedia/free APIs)
+    Stage 2 — Lightweight volume pre-screen across all constituents
+              Only stocks with RVOL > 2x pass to full analysis
+    Stage 3 — Full ATR + momentum analysis on pre-screened candidates
+    Stage 4 — Filter, rank, alert
+
+  Markets covered:
+    US  — S&P 500 (500 stocks) via Wikipedia
+    UK  — FTSE 100 (100 stocks) via Wikipedia  
+    DE  — DAX 40 (40 stocks) via Wikipedia
+    JP  — Nikkei 225 (225 stocks) via Wikipedia
+    ES  — Ibex 35 (35 stocks) via Wikipedia
+    FR  — CAC 40 (40 stocks) via Wikipedia
+    HK  — Hang Seng (82 stocks) via Wikipedia
 
   ⚠️  RISK DISCLAIMER:
   Consistently achieving >5% net daily returns is statistically rare and
@@ -39,6 +54,19 @@ MARKET_CONTEXT     = os.getenv("MARKET_CONTEXT", "all").lower()
 MIN_MOVE_PCT       = float(os.getenv("MIN_MOVE_PCT", "5.0"))
 DRY_RUN            = os.getenv("DRY_RUN", "false").lower() == "true"
 
+# ── Pre-screen thresholds ─────────────────────────────────────────────────────
+PRESCREEN_RVOL     = 1.5    # Minimum RVOL to pass pre-screen
+PRESCREEN_MIN_VOL  = {      # Minimum absolute volume per market
+    "us": 500_000,
+    "uk": 100_000,
+    "de": 50_000,
+    "jp": 100_000,
+    "es": 50_000,
+    "hk": 100_000,
+    "fr": 50_000,
+}
+MAX_PRESCREEN_PASS = 60     # Max stocks to run full analysis on per market
+
 # ── Fee model ─────────────────────────────────────────────────────────────────
 FEE_MODEL = {
     "us": {"commission_pct": 0.005, "spread_pct": 0.05,  "slippage_pct": 0.05},
@@ -50,211 +78,414 @@ FEE_MODEL = {
     "fr": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
 }
 
-# ── Ticker universe ────────────────────────────────────────────────────────────
-TICKER_UNIVERSE = {
-    "us": [
-        "NVDA","AMD","TSLA","META","AMZN","GOOGL","MSFT","AAPL","NFLX","CRM",
-        "PLTR","SNOW","RBLX","COIN","MSTR","SMCI","ARM","AVGO","MU","INTC",
-        "MRNA","BNTX","REGN","BIIB","VRTX",
-        "TQQQ","SQQQ","SPXL","UPRO","LABU","SOXL","TNA","FAS",
-        "CRWD","DDOG","NET","ZS","PANW","OKTA",
-        "XOM","CVX","OXY","HAL","SLB","FCX","NEM","GOLD",
-    ],
-    "uk": [
-        "HSBA.L","BP.L","SHEL.L","AZN.L","ULVR.L","RIO.L","GSK.L",
-        "BARC.L","LLOY.L","NWG.L","TSCO.L","VOD.L","BT-A.L","IAG.L",
-        "FERG.L","CRH.L","EXPN.L","SGRO.L","LGEN.L","PHNX.L",
-    ],
-    "de": [
-        "SAP.DE","SIE.DE","ALV.DE","MRK.DE","BAYN.DE","BMW.DE","MBG.DE",
-        "VOW3.DE","DTE.DE","DBK.DE","CON.DE","ADS.DE","EOAN.DE","RWE.DE",
-        "BAS.DE","HEI.DE","FRE.DE","MUV2.DE","DPW.DE","IFX.DE",
-    ],
-    "jp": [
-        "7203.T","9984.T","6758.T","6861.T","8306.T","9432.T","6501.T",
-        "7974.T","4519.T","8316.T","6902.T","4661.T","9433.T","8035.T",
-        "6954.T","7267.T","4543.T","2914.T","9020.T","4568.T",
-    ],
-    "es": [
-        # Ibex 35 — Spain (.MC)
-        "SAN.MC","BBVA.MC","ITX.MC","IBE.MC","REP.MC","TEF.MC","AMS.MC",
-        "ANA.MC","ELE.MC","CLNX.MC","FER.MC","GRF.MC","IAG.MC","MAP.MC",
-        "MEL.MC","MTS.MC","NTGY.MC","RED.MC","ROVI.MC","SAB.MC",
-    ],
-    "hk": [
-        # Hang Seng — Hong Kong (.HK)
-        "0700.HK","0005.HK","0939.HK","1299.HK","0941.HK","2318.HK","0388.HK",
-        "1398.HK","2628.HK","0003.HK","0011.HK","0002.HK","0016.HK","0027.HK",
-        "1810.HK","9988.HK","0175.HK","1177.HK","2020.HK","6862.HK",
-    ],
-    "fr": [
-        # CAC 40 — France (.PA)
-        "MC.PA","OR.PA","TTE.PA","SAN.PA","AIR.PA","BNP.PA","SU.PA","RI.PA",
-        "CAP.PA","ACA.PA","BN.PA","KER.PA","DG.PA","GLE.PA","HO.PA","LR.PA",
-        "ML.PA","ORA.PA","PUB.PA","RMS.PA","SAF.PA","SGO.PA","STLA.PA",
-        "STM.PA","SW.PA","VIE.PA","VIV.PA","WLN.PA","CS.PA","EDF.PA",
-    ],
+# ── Global run stats ──────────────────────────────────────────────────────────
+_STATS = {
+    "universe_total": 0,
+    "prescreen_pass": 0,
+    "data_fail":      0,
+    "filtered":       0,
+    "candidates":     0,
+    "by_market":      {},
 }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DATA LAYER
+#  STAGE 1 — DYNAMIC UNIVERSE FETCH
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def flatten_yf_df(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    yfinance v0.2+ returns MultiIndex columns like ('Close', 'HSBA.L').
-    This flattens them to plain column names: 'Close', 'Open', etc.
-    """
+def fetch_sp500() -> list:
+    """S&P 500 constituents from Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url)
+        df = tables[0]
+        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        logger.info(f"  S&P 500: {len(tickers)} constituents fetched")
+        return tickers
+    except Exception as e:
+        logger.warning(f"  S&P 500 fetch failed: {e} — using fallback")
+        return _sp500_fallback()
+
+
+def fetch_ftse100() -> list:
+    """FTSE 100 constituents from Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/FTSE_100_Index"
+        tables = pd.read_html(url)
+        # Find the table with ticker column
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("ticker" in c or "epic" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["ticker","epic","symbol"])][0]
+                tickers = [f"{s}.L" for s in t[col].dropna().tolist()]
+                logger.info(f"  FTSE 100: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  FTSE 100 fetch failed: {e} — using fallback")
+        return _ftse100_fallback()
+
+
+def fetch_dax() -> list:
+    """DAX 40 constituents from Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/DAX"
+        tables = pd.read_html(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("ticker" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["ticker","symbol"])][0]
+                tickers = [f"{s}.DE" if not str(s).endswith(".DE") else s
+                           for s in t[col].dropna().tolist()]
+                logger.info(f"  DAX: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  DAX fetch failed: {e} — using fallback")
+        return _dax_fallback()
+
+
+def fetch_nikkei225() -> list:
+    """Nikkei 225 constituents from Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/Nikkei_225"
+        tables = pd.read_html(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("code" in c or "ticker" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["code","ticker","symbol"])][0]
+                tickers = [f"{str(s).zfill(4)}.T" for s in t[col].dropna().tolist()
+                           if str(s).strip().isdigit()]
+                logger.info(f"  Nikkei 225: {len(tickers)} constituents fetched")
+                return tickers[:225]
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  Nikkei 225 fetch failed: {e} — using fallback")
+        return _nikkei_fallback()
+
+
+def fetch_ibex35() -> list:
+    """Ibex 35 constituents from Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/IBEX_35"
+        tables = pd.read_html(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("ticker" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["ticker","symbol"])][0]
+                tickers = [f"{s}.MC" if not str(s).endswith(".MC") else s
+                           for s in t[col].dropna().tolist()]
+                logger.info(f"  Ibex 35: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  Ibex 35 fetch failed: {e} — using fallback")
+        return _ibex_fallback()
+
+
+def fetch_cac40() -> list:
+    """CAC 40 constituents from Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/CAC_40"
+        tables = pd.read_html(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("ticker" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["ticker","symbol"])][0]
+                tickers = [f"{s}.PA" if not str(s).endswith(".PA") else s
+                           for s in t[col].dropna().tolist()]
+                logger.info(f"  CAC 40: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  CAC 40 fetch failed: {e} — using fallback")
+        return _cac40_fallback()
+
+
+def fetch_hangseng() -> list:
+    """Hang Seng constituents from Wikipedia."""
+    try:
+        url = "https://en.wikipedia.org/wiki/Hang_Seng_Index"
+        tables = pd.read_html(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("code" in c or "ticker" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["code","ticker"])][0]
+                tickers = [f"{str(s).zfill(4)}.HK" for s in t[col].dropna().tolist()
+                           if str(s).strip().replace(".","").isdigit()]
+                logger.info(f"  Hang Seng: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  Hang Seng fetch failed: {e} — using fallback")
+        return _hangseng_fallback()
+
+
+def get_universe(market_key: str) -> list:
+    """Fetch full index universe for a market. Falls back to static list."""
+    fetchers = {
+        "us": fetch_sp500,
+        "uk": fetch_ftse100,
+        "de": fetch_dax,
+        "jp": fetch_nikkei225,
+        "es": fetch_ibex35,
+        "fr": fetch_cac40,
+        "hk": fetch_hangseng,
+    }
+    fn = fetchers.get(market_key)
+    if fn:
+        tickers = fn()
+        if tickers:
+            return tickers
+    return []
+
+
+# ── Static fallbacks (used if Wikipedia fetch fails) ──────────────────────────
+
+def _sp500_fallback():
+    return [
+        "NVDA","AMD","TSLA","META","AMZN","GOOGL","MSFT","AAPL","NFLX","CRM",
+        "PLTR","SNOW","RBLX","COIN","MSTR","SMCI","ARM","AVGO","MU","INTC",
+        "MRNA","BNTX","REGN","BIIB","VRTX","TQQQ","SQQQ","SPXL","UPRO",
+        "LABU","SOXL","TNA","FAS","CRWD","DDOG","NET","ZS","PANW","OKTA",
+        "XOM","CVX","OXY","HAL","SLB","FCX","NEM","GOLD","JPM","BAC","GS",
+        "MS","WFC","C","V","MA","PYPL","SQ","SHOP","UBER","LYFT","ABNB",
+    ]
+
+def _ftse100_fallback():
+    return [f"{t}.L" for t in [
+        "HSBA","BP","SHEL","AZN","ULVR","RIO","GSK","BARC","LLOY","NWG",
+        "TSCO","VOD","BT-A","IAG","FERG","CRH","EXPN","SGRO","LGEN","PHNX",
+        "ABF","ADM","AHT","ANTO","AUTO","AV","AVV","BA","BAB","BATS",
+        "BDEV","BKG","BLND","BME","BNZL","BOC","BRBY","BT-A","CCH","CNA",
+    ]]
+
+def _dax_fallback():
+    return [f"{t}.DE" for t in [
+        "SAP","SIE","ALV","MRK","BAYN","BMW","MBG","VOW3","DTE","DBK",
+        "CON","ADS","EOAN","RWE","BAS","HEI","FRE","MUV2","DPW","IFX",
+        "MTX","MUV2","PAH3","PUM","QIA","RHM","SAP","SHL","SY1","ZAL",
+    ]]
+
+def _nikkei_fallback():
+    return [f"{t}.T" for t in [
+        "7203","9984","6758","6861","8306","9432","6501","7974","4519",
+        "8316","6902","4661","9433","8035","6954","7267","4543","2914","9020","4568",
+    ]]
+
+def _ibex_fallback():
+    return [f"{t}.MC" for t in [
+        "SAN","BBVA","ITX","IBE","REP","TEF","AMS","ANA","ELE","CLNX",
+        "FER","GRF","IAG","MAP","MEL","MTS","NTGY","RED","ROVI","SAB",
+    ]]
+
+def _cac40_fallback():
+    return [f"{t}.PA" for t in [
+        "MC","OR","TTE","SAN","AIR","BNP","SU","RI","CAP","ACA",
+        "BN","KER","DG","GLE","HO","LR","ML","ORA","PUB","RMS",
+        "SAF","SGO","STLA","STM","SW","VIE","VIV","WLN","CS","EDF",
+    ]]
+
+def _hangseng_fallback():
+    return [f"{t}.HK" for t in [
+        "0700","0005","0939","1299","0941","2318","0388","1398","2628","0003",
+        "0011","0002","0016","0027","1810","9988","0175","1177","2020","6862",
+    ]]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STAGE 2 — VOLUME PRE-SCREEN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def flatten_df(raw: pd.DataFrame) -> pd.DataFrame:
+    """Flatten yfinance v0.2+ MultiIndex columns."""
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
-    # Remove duplicate columns if any
-    raw = raw.loc[:, ~raw.columns.duplicated()]
-    return raw
+    return raw.loc[:, ~raw.columns.duplicated()]
 
+
+def prescreen_volume(tickers: list, market_key: str) -> list:
+    """
+    Lightweight volume pre-screen across all index constituents.
+    Fetches only 5 days of data per ticker — fast.
+    Returns tickers sorted by RVOL descending, capped at MAX_PRESCREEN_PASS.
+    
+    Logic: today's volume vs 4-day average.
+    RVOL > PRESCREEN_RVOL = elevated interest = worth full analysis.
+    """
+    min_vol  = PRESCREEN_MIN_VOL.get(market_key, 50_000)
+    screened = []
+    batch_size = 20  # yfinance handles batches well
+
+    logger.info(f"  Pre-screening {len(tickers)} tickers for elevated volume...")
+
+    # Process in batches for speed
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i+batch_size]
+        try:
+            raw = yf.download(
+                batch,
+                period="5d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                timeout=20,
+                group_by="ticker",
+            )
+            if raw is None or raw.empty:
+                continue
+
+            for ticker in batch:
+                try:
+                    # Extract single ticker from batch download
+                    if len(batch) == 1:
+                        df = flatten_df(raw.copy())
+                    else:
+                        if ticker not in raw.columns.get_level_values(0):
+                            continue
+                        df = raw[ticker].copy()
+                        df = df.loc[:, ~df.columns.duplicated()]
+
+                    if df is None or len(df) < 3:
+                        continue
+                    if "Volume" not in df.columns or "Close" not in df.columns:
+                        continue
+
+                    vols = df["Volume"].astype(float).values
+                    if len(vols) < 3:
+                        continue
+
+                    today_vol = float(vols[-1])
+                    avg_vol   = float(vols[:-1].mean()) if len(vols) > 1 else today_vol
+                    rvol      = today_vol / avg_vol if avg_vol > 0 else 1.0
+
+                    if today_vol >= min_vol and rvol >= PRESCREEN_RVOL:
+                        screened.append({
+                            "ticker": ticker,
+                            "rvol":   round(rvol, 2),
+                            "volume": int(today_vol),
+                        })
+                except Exception:
+                    continue
+
+        except Exception as e:
+            logger.debug(f"  Batch {i//batch_size + 1} error: {e}")
+
+        time.sleep(0.3)
+
+    # Sort by RVOL descending — highest conviction first
+    screened.sort(key=lambda x: x["rvol"], reverse=True)
+
+    logger.info(
+        f"  Pre-screen complete: {len(screened)} passed RVOL≥{PRESCREEN_RVOL}x "
+        f"from {len(tickers)} | Top RVOL: "
+        f"{screened[0]['ticker']} {screened[0]['rvol']}x" if screened else
+        f"  Pre-screen complete: 0 passed from {len(tickers)}"
+    )
+
+    # Cap at MAX_PRESCREEN_PASS for full analysis
+    if len(screened) > MAX_PRESCREEN_PASS:
+        logger.info(f"  Capping at top {MAX_PRESCREEN_PASS} by RVOL for full analysis")
+        screened = screened[:MAX_PRESCREEN_PASS]
+
+    return [s["ticker"] for s in screened]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STAGE 3 — FULL ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_snapshot(ticker: str) -> Optional[pd.DataFrame]:
-    """
-    Fetch daily OHLCV data. Tries multiple periods for resilience.
-    Flattens yfinance MultiIndex columns automatically.
-    """
-    for period in ["30d", "5d", "1mo"]:
-        for attempt in range(2):
-            try:
-                raw = yf.download(
-                    ticker,
-                    period=period,
-                    interval="1d",
-                    auto_adjust=True,
-                    progress=False,
-                    timeout=15,
-                )
-                if raw is None or len(raw) < 3:
-                    rows = len(raw) if raw is not None else 0
-                    logger.info(f"    {ticker}: {rows} rows (period={period}, attempt={attempt+1})")
-                    time.sleep(0.5)
-                    continue
-
-                df = flatten_yf_df(raw)
-
-                # Verify required columns exist
-                required = {"Open", "High", "Low", "Close", "Volume"}
-                if not required.issubset(set(df.columns)):
-                    logger.info(f"    {ticker}: missing columns — got {list(df.columns)}")
-                    time.sleep(0.5)
-                    continue
-
-                logger.info(f"    {ticker}: {len(df)} days OK (period={period})")
-                return df
-
-            except Exception as e:
-                logger.info(f"    {ticker}: error — {type(e).__name__}: {str(e)[:100]}")
-            time.sleep(0.5)
-
-    logger.info(f"    {ticker}: ❌ all attempts failed")
+    """Fetch 30 days daily OHLCV for full analysis."""
+    for period in ["30d", "1mo"]:
+        try:
+            raw = yf.download(
+                ticker, period=period, interval="1d",
+                auto_adjust=True, progress=False, timeout=15,
+            )
+            if raw is None or len(raw) < 5:
+                continue
+            df = flatten_df(raw)
+            required = {"Open","High","Low","Close","Volume"}
+            if not required.issubset(set(df.columns)):
+                continue
+            return df
+        except Exception as e:
+            logger.debug(f"    {ticker}: fetch error — {e}")
+        time.sleep(0.3)
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MATHEMATICAL FILTERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def compute_atr(df: pd.DataFrame, period: int = 10) -> float:
-    """ATR as % of latest close."""
     if len(df) < 3:
         return 0.0
     try:
-        period   = min(period, len(df) - 1)
-        high     = df["High"].astype(float).values
-        low      = df["Low"].astype(float).values
-        close    = df["Close"].astype(float).values
-        tr_list  = []
-        for i in range(1, len(close)):
-            tr = max(
-                high[i] - low[i],
-                abs(high[i] - close[i-1]),
-                abs(low[i]  - close[i-1]),
-            )
-            tr_list.append(tr)
-        atr = sum(tr_list[-period:]) / period
-        return (atr / close[-1]) * 100 if close[-1] > 0 else 0.0
-    except Exception as e:
-        logger.debug(f"ATR error: {e}")
+        period = min(period, len(df) - 1)
+        h = df["High"].astype(float).values
+        l = df["Low"].astype(float).values
+        c = df["Close"].astype(float).values
+        trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
+               for i in range(1, len(c))]
+        atr = sum(trs[-period:]) / period
+        return (atr / c[-1]) * 100 if c[-1] > 0 else 0.0
+    except Exception:
         return 0.0
 
 
 def compute_rvol(df: pd.DataFrame) -> float:
-    """Relative volume vs recent average."""
-    if len(df) < 3:
-        return 1.0
     try:
-        vols     = df["Volume"].astype(float).values
-        lookback = min(20, len(vols) - 1)
-        avg_vol  = sum(vols[-lookback-1:-1]) / lookback
-        return float(vols[-1]) / avg_vol if avg_vol > 0 else 1.0
+        vols = df["Volume"].astype(float).values
+        lb   = min(20, len(vols) - 1)
+        avg  = sum(vols[-lb-1:-1]) / lb
+        return float(vols[-1]) / avg if avg > 0 else 1.0
     except Exception:
         return 1.0
 
 
 def compute_rsi(closes, period: int = 10) -> float:
-    """RSI momentum indicator."""
     period = min(period, len(closes) - 2)
     if period < 2:
         return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = float(closes[i]) - float(closes[i-1])
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    return 100 - (100 / (1 + avg_gain / avg_loss))
+    gains = [max(float(closes[i])-float(closes[i-1]), 0) for i in range(1, len(closes))]
+    losses= [max(float(closes[i-1])-float(closes[i]), 0) for i in range(1, len(closes))]
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period
+    return 100.0 if al == 0 else 100 - (100 / (1 + ag/al))
 
 
 def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
-    """Compute all metrics for a ticker with verbose logging."""
     try:
-        close  = df["Close"].astype(float).values
-        open_  = df["Open"].astype(float).values
-        high   = df["High"].astype(float).values
-        low    = df["Low"].astype(float).values
-        volume = df["Volume"].astype(float).values
+        c = df["Close"].astype(float).values
+        o = df["Open"].astype(float).values
+        h = df["High"].astype(float).values
+        l = df["Low"].astype(float).values
+        v = df["Volume"].astype(float).values
 
         atr_pct    = compute_atr(df)
         rvol       = compute_rvol(df)
-        rsi        = compute_rsi(close)
+        rsi        = compute_rsi(c)
+        day_return = ((c[-1]-c[-2])/c[-2]*100) if len(c)>=2 and c[-2]>0 else 0.0
+        day_range  = ((h[-1]-l[-1])/l[-1]*100) if l[-1]>0 else 0.0
 
-        day_return = ((close[-1] - close[-2]) / close[-2] * 100) if len(close) >= 2 and close[-2] > 0 else 0.0
-        day_range  = ((high[-1] - low[-1]) / low[-1] * 100) if low[-1] > 0 else 0.0
-        gap_pct    = ((open_[-1] - close[-2]) / close[-2] * 100) if len(close) >= 2 and close[-2] > 0 else 0.0
-
-        # Composite score
         score = (
-            min(atr_pct / 5.0, 1.0) * 30 +
-            min(rvol / 3.0, 1.0) * 25 +
-            min(abs(day_return) / 3.0, 1.0) * 25 +
-            (1.0 if 60 <= rsi <= 80 else 0.6 if 40 <= rsi < 60 else 0.4) * 20
+            min(atr_pct/5.0, 1.0)*30 +
+            min(rvol/3.0, 1.0)*25 +
+            min(abs(day_return)/3.0, 1.0)*25 +
+            (1.0 if 60<=rsi<=80 else 0.6 if 40<=rsi<60 else 0.4)*20
         )
 
         logger.info(
-            f"    {ticker}: price={close[-1]:.2f} | ATR={atr_pct:.2f}% | "
+            f"    {ticker}: price={c[-1]:.2f} | ATR={atr_pct:.2f}% | "
             f"RVOL={rvol:.2f}x | RSI={rsi:.0f} | day={day_return:+.2f}% | "
-            f"range={day_range:.2f}% | vol={int(volume[-1]):,} | score={score:.0f}"
+            f"range={day_range:.2f}% | vol={int(v[-1]):,} | score={score:.0f}"
         )
 
         return {
-            "ticker":     ticker,
-            "price":      round(float(close[-1]), 4),
-            "atr_pct":    round(atr_pct, 2),
-            "rvol":       round(rvol, 2),
-            "rsi":        round(rsi, 1),
-            "gap_pct":    round(gap_pct, 2),
-            "day_return": round(day_return, 2),
-            "day_range":  round(day_range, 2),
-            "volume":     int(volume[-1]),
-            "score":      round(score, 1),
+            "ticker": ticker, "price": round(float(c[-1]),4),
+            "atr_pct": round(atr_pct,2), "rvol": round(rvol,2),
+            "rsi": round(rsi,1), "day_return": round(day_return,2),
+            "day_range": round(day_range,2), "volume": int(v[-1]),
+            "score": round(score,1),
         }
     except Exception as e:
         logger.info(f"    {ticker}: analysis error — {e}")
@@ -262,66 +493,70 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
 
 
 def passes_filters(m: dict, market: str) -> tuple:
-    """
-    Return (passed, reason).
-    Volume and RVOL filters are ALWAYS enforced — low volume = illiquid = untradeable.
-    ATR and score filters only apply when MIN_MOVE_PCT > 0.
-    """
-    vol   = m.get("volume", 0)
-    score = m.get("score", 0)
-    atr   = m.get("atr_pct", 0)
-    rvol  = m.get("rvol", 0)
+    """Volume and RVOL always enforced. ATR/score only when target > 0."""
+    vol  = m.get("volume", 0)
+    rvol = m.get("rvol", 0)
+    atr  = m.get("atr_pct", 0)
+    score= m.get("score", 0)
 
-    # ── Always enforced — liquidity gates ─────────────────────────────────────
-    min_vol = 50_000 if market == "uk" else 100_000
+    min_vol = PRESCREEN_MIN_VOL.get(market, 50_000)
     if vol < min_vol:
         return False, f"vol {vol:,} < {min_vol:,}"
-
     if rvol < 1.3:
         return False, f"RVOL {rvol:.2f}x < 1.3x"
 
-    # ── Move threshold gates (only when target > 0) ───────────────────────────
     if MIN_MOVE_PCT > 0:
         if atr < MIN_MOVE_PCT * 0.7:
             return False, f"ATR {atr:.2f}% < {MIN_MOVE_PCT*0.7:.2f}%"
         if score < 35:
             return False, f"score {score:.0f} < 35"
     else:
-        # No move threshold — just need minimum score sanity check
         if score < 20:
             return False, f"score {score:.0f} < 20"
 
     return True, "passed"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FEE MODEL
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def net_yield(gross_pct: float, market: str) -> float:
-    fees = FEE_MODEL.get(market, FEE_MODEL["us"])
-    cost = (fees["commission_pct"] + fees["spread_pct"] + fees["slippage_pct"]) * 2
-    return round(gross_pct - cost, 2)
+def net_yield(atr_pct: float, market: str) -> float:
+    f = FEE_MODEL.get(market, FEE_MODEL["us"])
+    cost = (f["commission_pct"] + f["spread_pct"] + f["slippage_pct"]) * 2
+    return round(atr_pct - cost, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SCANNER
+#  STAGE 4 — ORCHESTRATION
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# Global stats accumulated across all markets in a run
-_STATS = {"scanned": 0, "data_fail": 0, "filtered": 0, "candidates": 0, "by_market": {}}
-
 
 def scan_market(market_key: str) -> list:
-    tickers = TICKER_UNIVERSE.get(market_key, [])
-    if not tickers:
+    logger.info(f"\n{'='*60}")
+    logger.info(f"MARKET: {market_key.upper()} | Target: >{MIN_MOVE_PCT}%")
+    logger.info(f"{'='*60}")
+
+    # Stage 1: Get full universe
+    universe = get_universe(market_key)
+    if not universe:
+        logger.warning(f"  No universe for {market_key}")
+        return []
+    logger.info(f"  Universe: {len(universe)} stocks")
+
+    # Stage 2: Volume pre-screen
+    prescreened = prescreen_volume(universe, market_key)
+    if not prescreened:
+        logger.info(f"  No stocks passed pre-screen — market may be inactive")
+        _STATS["by_market"][market_key.upper()] = {
+            "universe": len(universe), "prescreen_pass": 0,
+            "data_fail": 0, "filtered": 0, "candidates": 0,
+        }
+        _STATS["universe_total"] += len(universe)
         return []
 
-    logger.info(f"\nScanning {market_key.upper()}: {len(tickers)} tickers | target >{MIN_MOVE_PCT}%")
+    logger.info(f"\n  Full analysis on {len(prescreened)} pre-screened stocks:")
+
+    # Stage 3: Full analysis
     candidates, data_fail, filtered = [], 0, 0
 
-    for i, ticker in enumerate(tickers, 1):
-        logger.info(f"  [{i}/{len(tickers)}] {ticker}")
+    for i, ticker in enumerate(prescreened, 1):
+        logger.info(f"  [{i}/{len(prescreened)}] {ticker}")
         df = fetch_snapshot(ticker)
         if df is None:
             data_fail += 1
@@ -339,31 +574,42 @@ def scan_market(market_key: str) -> list:
             continue
 
         logger.info(f"    {ticker}: ✅ CANDIDATE")
-        candidates.append({**m, "market": market_key.upper(),
-                           "net_yield": net_yield(m["atr_pct"], market_key)})
+        candidates.append({
+            **m,
+            "market":    market_key.upper(),
+            "net_yield": net_yield(m["atr_pct"], market_key),
+        })
         time.sleep(0.2)
 
-    logger.info(f"\n{market_key.upper()}: scanned={len(tickers)} | "
-                f"data_fail={data_fail} | filtered={filtered} | candidates={len(candidates)}")
-
-    # Accumulate into global stats
-    _STATS["scanned"]    += len(tickers)
-    _STATS["data_fail"]  += data_fail
-    _STATS["filtered"]   += filtered
-    _STATS["candidates"] += len(candidates)
+    # Accumulate stats
+    _STATS["universe_total"] += len(universe)
+    _STATS["prescreen_pass"] += len(prescreened)
+    _STATS["data_fail"]      += data_fail
+    _STATS["filtered"]       += filtered
+    _STATS["candidates"]     += len(candidates)
     _STATS["by_market"][market_key.upper()] = {
-        "scanned": len(tickers), "data_fail": data_fail,
-        "filtered": filtered,    "candidates": len(candidates),
+        "universe":       len(universe),
+        "prescreen_pass": len(prescreened),
+        "data_fail":      data_fail,
+        "filtered":       filtered,
+        "candidates":     len(candidates),
     }
+
+    logger.info(
+        f"\n  {market_key.upper()}: universe={len(universe)} | "
+        f"prescreen={len(prescreened)} | data_fail={data_fail} | "
+        f"filtered={filtered} | candidates={len(candidates)}"
+    )
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates
 
 
 def run_all_markets() -> list:
-    # Reset stats for this run
-    _STATS.update({"scanned": 0, "data_fail": 0, "filtered": 0,
-                   "candidates": 0, "by_market": {}})
+    _STATS.update({
+        "universe_total": 0, "prescreen_pass": 0,
+        "data_fail": 0, "filtered": 0, "candidates": 0, "by_market": {},
+    })
 
     if MARKET_CONTEXT == "all":
         markets = ["us", "uk", "de", "jp", "es", "hk", "fr"]
@@ -371,29 +617,31 @@ def run_all_markets() -> list:
         markets = ["uk", "de", "es", "fr"]
     elif MARKET_CONTEXT == "asia":
         markets = ["jp", "hk"]
-    elif MARKET_CONTEXT in TICKER_UNIVERSE:
-        markets = [MARKET_CONTEXT]
     else:
-        markets = ["us", "uk", "de", "jp", "es", "hk", "fr"]
+        markets = [MARKET_CONTEXT] if MARKET_CONTEXT in FEE_MODEL else ["us"]
 
     all_c = []
     for m in markets:
         all_c.extend(scan_market(m))
     all_c.sort(key=lambda x: x["score"], reverse=True)
 
-    # Print global summary table
-    logger.info("\n" + "=" * 62)
+    # Global summary
+    logger.info("\n" + "=" * 72)
     logger.info("GLOBAL SCAN SUMMARY")
-    logger.info("=" * 62)
-    logger.info(f"  {'Market':<8} {'Scanned':>8} {'Failed':>8} {'Filtered':>10} {'Candidates':>12}")
-    logger.info(f"  {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*12}")
+    logger.info("=" * 72)
+    logger.info(f"  {'Market':<8} {'Universe':>10} {'Pre-screen':>12} {'Failed':>8} {'Filtered':>10} {'Final':>8}")
+    logger.info(f"  {'-'*8} {'-'*10} {'-'*12} {'-'*8} {'-'*10} {'-'*8}")
     for mkt, s in _STATS["by_market"].items():
-        logger.info(f"  {mkt:<8} {s['scanned']:>8} {s['data_fail']:>8} "
-                    f"{s['filtered']:>10} {s['candidates']:>12}")
-    logger.info(f"  {'─'*8} {'─'*8} {'─'*8} {'─'*10} {'─'*12}")
-    logger.info(f"  {'TOTAL':<8} {_STATS['scanned']:>8} {_STATS['data_fail']:>8} "
-                f"{_STATS['filtered']:>10} {_STATS['candidates']:>12}")
-    logger.info("=" * 62)
+        logger.info(
+            f"  {mkt:<8} {s['universe']:>10} {s['prescreen_pass']:>12} "
+            f"{s['data_fail']:>8} {s['filtered']:>10} {s['candidates']:>8}"
+        )
+    logger.info(f"  {'─'*8} {'─'*10} {'─'*12} {'─'*8} {'─'*10} {'─'*8}")
+    logger.info(
+        f"  {'TOTAL':<8} {_STATS['universe_total']:>10} {_STATS['prescreen_pass']:>12} "
+        f"{_STATS['data_fail']:>8} {_STATS['filtered']:>10} {_STATS['candidates']:>8}"
+    )
+    logger.info("=" * 72)
 
     return all_c
 
@@ -404,10 +652,14 @@ def run_all_markets() -> list:
 
 def format_markdown(candidates: list) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    stats_by_mkt = _STATS.get("by_market", {})
+
     if not candidates:
         return (
             f"## 📊 Intraday Scanner — {now}\n\n"
             f"**Market:** {MARKET_CONTEXT.upper()}  |  **Target:** >{MIN_MOVE_PCT}%\n\n"
+            f"**Universe scanned:** {_STATS['universe_total']:,} stocks  |  "
+            f"**Pre-screened:** {_STATS['prescreen_pass']}  |  **Candidates:** 0\n\n"
             "**No candidates met the filter criteria.**\n\n"
             "> ⚠️ Research only. Not financial advice.\n"
         )
@@ -415,13 +667,16 @@ def format_markdown(candidates: list) -> str:
     lines = [
         f"## 📊 Intraday Scanner — {now}",
         f"**Market:** {MARKET_CONTEXT.upper()}  |  **Target:** >{MIN_MOVE_PCT}%  |  **Candidates:** {len(candidates)}",
+        f"**Universe:** {_STATS['universe_total']:,} stocks scanned  |  "
+        f"**Pre-screen pass:** {_STATS['prescreen_pass']}  |  "
+        f"**Final candidates:** {_STATS['candidates']}",
         "",
         "> ⚠️ Research only. Not financial advice. Past ATR ≠ future moves.",
         "",
         "| # | Ticker | Mkt | Price | Day% | Range% | ATR% | RVOL | RSI | Score | Net |",
         "|---|--------|-----|-------|------|--------|------|------|-----|-------|-----|",
     ]
-    for i, c in enumerate(candidates[:25], 1):
+    for i, c in enumerate(candidates[:30], 1):
         e = "🟢" if c["day_return"] > 0 else "🔴"
         n = "✅" if c["net_yield"] > 0 else "❌"
         lines.append(
@@ -429,18 +684,38 @@ def format_markdown(candidates: list) -> str:
             f"{e}{c['day_return']:+.1f}% | {c['day_range']:.1f}% | {c['atr_pct']:.1f}% | "
             f"{c['rvol']:.1f}x | {c['rsi']:.0f} | **{c['score']:.0f}** | {n}{c['net_yield']:+.1f}% |"
         )
+
+    # Per-market breakdown table
+    if stats_by_mkt:
+        lines += [
+            "",
+            "### Market Breakdown",
+            "| Market | Universe | Pre-screen | Failed | Filtered | Candidates |",
+            "|--------|----------|------------|--------|----------|------------|",
+        ]
+        for mkt, s in stats_by_mkt.items():
+            lines.append(
+                f"| {mkt} | {s['universe']:,} | {s['prescreen_pass']} | "
+                f"{s['data_fail']} | {s['filtered']} | {s['candidates']} |"
+            )
+        lines.append(
+            f"| **TOTAL** | **{_STATS['universe_total']:,}** | "
+            f"**{_STATS['prescreen_pass']}** | **{_STATS['data_fail']}** | "
+            f"**{_STATS['filtered']}** | **{_STATS['candidates']}** |"
+        )
+
     return "\n".join(lines)
 
 
 def format_telegram(candidates: list) -> str:
-    now  = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    top  = candidates[:10]
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
     lines = [
         f"📊 <b>Intraday Scanner — {now}</b>",
-        f"Market: {MARKET_CONTEXT.upper()} | Target: >{MIN_MOVE_PCT}% | Found: {len(candidates)}",
+        f"Market: {MARKET_CONTEXT.upper()} | Target: >{MIN_MOVE_PCT}% | "
+        f"Universe: {_STATS['universe_total']:,} | Found: {len(candidates)}",
         "",
     ]
-    for i, c in enumerate(top, 1):
+    for i, c in enumerate(candidates[:10], 1):
         e = "🟢" if c["day_return"] > 0 else "🔴"
         lines.append(
             f"{i}. <b>{c['ticker']}</b> {e}{c['day_return']:+.1f}% | "
@@ -490,7 +765,7 @@ def send_telegram_doc(filepath: str, caption: str = "") -> bool:
 
 def main():
     logger.info("=" * 60)
-    logger.info("INTRADAY MOMENTUM SCANNER v3")
+    logger.info("INTRADAY MOMENTUM SCANNER v4 — Dynamic Universe")
     logger.info(f"Market:  {MARKET_CONTEXT.upper()}")
     logger.info(f"Target:  >{MIN_MOVE_PCT}%")
     logger.info(f"Mode:    {'DRY RUN' if DRY_RUN else 'LIVE'}")
@@ -514,10 +789,12 @@ def main():
             send_telegram(
                 f"📊 <b>Scanner — {datetime.now(timezone.utc).strftime('%H:%M UTC')}</b>\n"
                 f"Market: {MARKET_CONTEXT.upper()} | Target: >{MIN_MOVE_PCT}%\n"
+                f"Universe: {_STATS['universe_total']:,} stocks\n"
                 "No candidates this scan."
             )
 
-    logger.info(f"Complete — {len(candidates)} candidates found")
+    logger.info(f"Complete — {len(candidates)} candidates from "
+                f"{_STATS['universe_total']:,} stocks scanned")
 
 
 if __name__ == "__main__":
