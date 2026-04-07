@@ -1,17 +1,18 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
   INTRADAY MOMENTUM SCANNER v4 — Dynamic Universe
-  
+
   Architecture:
     Stage 1 — Fetch full index constituents dynamically (Wikipedia/free APIs)
     Stage 2 — Lightweight volume pre-screen across all constituents
-              Only stocks with RVOL > 2x pass to full analysis
+              Passes if RVOL >= 1.2x OR ATR >= 2.5% (plus volume floor)
     Stage 3 — Full ATR + momentum analysis on pre-screened candidates
     Stage 4 — Filter, rank, alert
 
   Markets covered:
-    US  — S&P 500 (500 stocks) via Wikipedia
-    UK  — FTSE 100 (100 stocks) via Wikipedia  
+    US  — S&P 500 (~503) + NASDAQ supplement (~162) + Russell 2000 curated (~192)
+          Total ~857 stocks
+    UK  — FTSE 100 (100 stocks) via Wikipedia
     DE  — DAX 40 (40 stocks) via Wikipedia
     JP  — Nikkei 225 (225 stocks) via Wikipedia
     ES  — Ibex 35 (35 stocks) via Wikipedia
@@ -504,7 +505,7 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
             avg_vol   = float(vols[:-1].mean()) if len(vols) > 1 else today_vol
             rvol      = today_vol / avg_vol if avg_vol > 0 else 1.0
 
-            # Compute lightweight ATR% for the OR condition
+            # Lightweight ATR for the OR gate
             atr_pct = 0.0
             if "High" in df.columns and "Low" in df.columns and "Close" in df.columns:
                 h = df["High"].astype(float).values
@@ -520,10 +521,10 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
             passes_atr  = atr_pct >= PRESCREEN_ATR
             if today_vol >= min_vol and (passes_rvol or passes_atr):
                 screened.append({
-                    "ticker":  ticker,
-                    "rvol":    round(rvol, 2),
-                    "atr_pct": round(atr_pct, 2),
-                    "volume":  int(today_vol),
+                    "ticker":    ticker,
+                    "rvol":      round(rvol, 2),
+                    "atr_pct":   round(atr_pct, 2),
+                    "volume":    int(today_vol),
                     "passed_by": "RVOL" if passes_rvol else "ATR",
                 })
 
@@ -661,17 +662,23 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
 
 
 def passes_filters(m: dict, market: str) -> tuple:
-    """Volume and RVOL always enforced. ATR/score only when target > 0."""
-    vol  = m.get("volume", 0)
-    rvol = m.get("rvol", 0)
-    atr  = m.get("atr_pct", 0)
-    score= m.get("score", 0)
+    """
+    Volume floor always required.
+    Momentum gate: RVOL >= 1.3x OR ATR >= PRESCREEN_ATR (same OR logic as pre-screen).
+    ATR/score gates only applied when MIN_MOVE_PCT > 0.
+    """
+    vol   = m.get("volume", 0)
+    rvol  = m.get("rvol", 0)
+    atr   = m.get("atr_pct", 0)
+    score = m.get("score", 0)
 
     min_vol = PRESCREEN_MIN_VOL.get(market, 50_000)
     if vol < min_vol:
         return False, f"vol {vol:,} < {min_vol:,}"
-    if rvol < 1.3:
-        return False, f"RVOL {rvol:.2f}x < 1.3x"
+
+    # Momentum gate: RVOL OR ATR — consistent with pre-screen logic
+    if rvol < 1.3 and atr < PRESCREEN_ATR:
+        return False, f"RVOL {rvol:.2f}x < 1.3x and ATR {atr:.2f}% < {PRESCREEN_ATR}%"
 
     if MIN_MOVE_PCT > 0:
         if atr < MIN_MOVE_PCT * 0.7:
