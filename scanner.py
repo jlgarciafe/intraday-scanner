@@ -796,6 +796,38 @@ def run_all_markets() -> list:
 
     return all_c
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PATCH FOR scanner.py
+# Add this block at the END of the candidates processing section in main(),
+# just before you build the Telegram message (or at the very end of main()).
+# It writes scan_results.json for ta_runner.py to consume.
+# ═══════════════════════════════════════════════════════════════════════════
+
+import json as _json
+
+_output_file = os.getenv("OUTPUT_JSON", "scan_results.json")
+_scan_output = []
+
+for c in candidates:           # 'candidates' is your existing list
+    _scan_output.append({
+        "ticker":        c.get("ticker") or c.get("symbol"),
+        "price":         c.get("price") or c.get("last_price"),
+        "change_pct":    c.get("change_pct") or c.get("pct_change"),
+        "rvol":          c.get("rvol"),
+        "atr_pct":       c.get("atr_pct"),
+        "score":         c.get("score"),
+        "market":        MARKET_CONTEXT,     # already defined in scanner.py
+        "scan_time_utc": datetime.utcnow().isoformat(),  # already imported
+    })
+
+with open(_output_file, "w") as _f:
+    _json.dump(_scan_output, _f, indent=2)
+
+print(f"[scanner] Wrote {len(_scan_output)} candidate(s) to {_output_file}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# END OF PATCH
+# ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  OUTPUT
