@@ -1,25 +1,25 @@
-name: Intraday Market Scanner
+name: Intraday Market Scanner + TA Entry
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schedule (all times UTC):
-#   Hong Kong open:  01:30 UTC  (09:30 HKT)
-#   Tokyo open:      00:00 UTC  (09:00 JST)
-#   Frankfurt open:  07:00 UTC  (09:00 CEST)
-#   London/Madrid:   08:00 UTC  (09:00 BST / 10:00 CEST)
-#   US open:         13:30 UTC  (09:30 EST)
-#   US mid-session:  16:00 UTC  (12:00 EST)
-#   US close:        20:00 UTC  (16:00 EST)
+# Schedule (UTC):
+#   01:30  Hong Kong open
+#   00:00  Tokyo open
+#   07:00  Frankfurt / EU open
+#   08:00  London / Madrid / Paris open
+#   13:30  US open
+#   16:00  US mid-session
+#   20:00  US close
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    - cron: "30 1 * * 1-5"   # Hong Kong open
-    - cron: "0 0 * * 1-5"    # Tokyo open
-    - cron: "0 7 * * 1-5"    # Frankfurt / EU open
-    - cron: "0 8 * * 1-5"    # London / Madrid / Paris open
-    - cron: "30 13 * * 1-5"  # US open (09:30 EST)
-    - cron: "0 16 * * 1-5"   # US mid-session (12:00 EST)
-    - cron: "0 20 * * 1-5"   # US close scan (16:00 EST)
+    - cron: "30 1  * * 1-5"   # HK open
+    - cron: "0  0  * * 1-5"   # Tokyo open
+    - cron: "0  7  * * 1-5"   # EU open
+    - cron: "0  8  * * 1-5"   # Madrid / Paris
+    - cron: "30 13 * * 1-5"   # US open
+    - cron: "0  16 * * 1-5"   # US mid
+    - cron: "0  20 * * 1-5"   # US close
 
   workflow_dispatch:
     inputs:
@@ -29,20 +29,32 @@ on:
         default: "all"
         type: string
       min_move_pct:
-        description: "Minimum target move % (default 5.0)"
+        description: "Minimum move % to qualify a ticker (default 3.0)"
         required: false
-        default: "5.0"
+        default: "3.0"
         type: string
+      skip_ta:
+        description: "Skip TA entry runner (scan only)"
+        required: false
+        default: "false"
+        type: boolean
       dry_run:
-        description: "Dry run — logs only, no Telegram"
+        description: "Dry run — logs + artifacts only, no Telegram"
         required: false
         default: "false"
         type: boolean
 
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 — INTRADAY SCANNER
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
   scan:
+    name: Intraday Scanner
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
+    outputs:
+      tickers_found: ${{ steps.run_scanner.outputs.tickers_found }}
+      scan_file:     ${{ steps.run_scanner.outputs.scan_file }}
 
     steps:
       - name: Checkout repository
@@ -61,29 +73,94 @@ jobs:
         id: market_context
         run: |
           HOUR=$(date -u +%H)
+          MIN=$(date -u +%M)
           MARKET="all"
           if [ "$HOUR" = "00" ]; then MARKET="jp"; fi
           if [ "$HOUR" = "01" ]; then MARKET="hk"; fi
           if [ "$HOUR" = "07" ] || [ "$HOUR" = "08" ]; then MARKET="eu"; fi
           if [ "$HOUR" = "13" ] || [ "$HOUR" = "16" ] || [ "$HOUR" = "20" ]; then MARKET="us"; fi
+          # Manual override
           INPUT="${{ github.event.inputs.market }}"
-          if [ -n "$INPUT" ]; then MARKET="$INPUT"; fi
+          if [ -n "$INPUT" ] && [ "$INPUT" != "all" ]; then MARKET="$INPUT"; fi
           echo "market=$MARKET" >> $GITHUB_OUTPUT
-          echo "Active market context: $MARKET"
+          echo "Active market: $MARKET"
 
       - name: Run intraday scanner
+        id: run_scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           MARKET_CONTEXT:     ${{ steps.market_context.outputs.market }}
-          MIN_MOVE_PCT:       ${{ github.event.inputs.min_move_pct || '5.0' }}
+          MIN_MOVE_PCT:       ${{ github.event.inputs.min_move_pct || '3.0' }}
           DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
-        run: python scanner.py
+          OUTPUT_JSON:        "scan_results.json"   # scanner writes this file
+        run: |
+          python scanner.py
+          # Count qualifying tickers from JSON output
+          if [ -f scan_results.json ]; then
+            COUNT=$(python3 -c "import json; d=json.load(open('scan_results.json')); print(len(d))")
+          else
+            COUNT=0
+          fi
+          echo "tickers_found=$COUNT" >> $GITHUB_OUTPUT
+          echo "scan_file=scan_results.json" >> $GITHUB_OUTPUT
+          echo "Scanner found $COUNT qualifying ticker(s)"
 
-      - name: Upload scan results
+      - name: Upload scan results artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scan-results-${{ github.run_number }}
-          path: "*.md"
+          path: |
+            scan_results.json
+            *.md
           retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2 — TA ENTRY RUNNER
+# Runs only when scanner found ≥1 ticker AND skip_ta is false
+# ─────────────────────────────────────────────────────────────────────────────
+  ta_entry:
+    name: TA Entry Framework
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: |
+      needs.scan.outputs.tickers_found != '0' &&
+      github.event.inputs.skip_ta != 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download scan results from scanner job
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-results-${{ github.run_number }}
+
+      - name: Run TA entry analysis
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          python ta_runner.py --from-file scan_results.json
+
+      - name: Upload TA results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ta-entry-${{ github.run_number }}
+          path: |
+            orders.json
+            ta_report.md
+          retention-days: 14
