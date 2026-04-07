@@ -418,6 +418,81 @@ def format_markdown_row(r):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def format_summary_table(actionable, now_str, total_scanned):
+    """
+    Clean summary table of all actionable setups.
+    Columns: Ticker | Trend | Entry Zone | Stop Loss | T1 | T2 | Exit | Verdict | Catalyst
+    """
+    if not actionable:
+        return ""
+
+    lines = [
+        f"",
+        f"## TA Entry Summary -- {now_str}",
+        f"**{len(actionable)} actionable setup(s) from {total_scanned} scanned**",
+        f"",
+        f"| # | Ticker | Trend | Entry Zone | Stop Loss | Target 1 | Target 2 | Exit | Verdict | Catalyst |",
+        f"|---|--------|-------|------------|-----------|----------|----------|------|---------|----------|",
+    ]
+
+    for i, r in enumerate(actionable, 1):
+        ccy      = r.get("currency", "USD")
+        ticker   = r["ticker"]
+        trend    = r.get("trend_primary", "-")
+        entry    = f"{ccy} {r['entry_low']:.2f}-{r['entry_high']:.2f}"
+        stop     = f"{ccy} {r['stop_loss']:.2f} (-{r['stop_pct']:.1f}%)"
+        t1       = f"{ccy} {r['target_1']:.2f} ({r['rr_t1']:.1f}:1)"
+        t2       = f"{ccy} {r['target_2']:.2f} ({r['rr_t2']:.1f}:1)"
+        exit_p   = f"{ccy} {r['recommended_exit']:.2f} ({r['rr_exit']:.1f}:1)"
+        verdict  = r.get("verdict", "-")
+        catalyst = r.get("catalyst_note") or "None"
+        lines.append(
+            f"| {i} | **{ticker}** | {trend} | {entry} | {stop} "
+            f"| {t1} | {t2} | {exit_p} | {verdict} | {catalyst} |"
+        )
+
+    return "\n".join(lines)
+
+
+def format_summary_telegram(actionable, now_str, total_scanned):
+    """Compact Telegram version of the summary table."""
+    lines = [
+        f"ACTIONABLE SETUPS SUMMARY -- {now_str}",
+        f"{len(actionable)} selected from {total_scanned} scanned",
+        f"",
+    ]
+    for i, r in enumerate(actionable, 1):
+        ccy     = r.get("currency", "USD")
+        verdict = r.get("verdict", "-")
+        # Short verdict label
+        if verdict.startswith("ENTER"):
+            tag = "ENTER"
+        elif verdict.startswith("WAIT FOR DIP"):
+            tag = "DIP"
+        elif verdict.startswith("WAIT FOR BREAKOUT"):
+            tag = "BRKOUT"
+        else:
+            tag = verdict[:8]
+
+        catalyst = r.get("catalyst_note") or "-"
+        lines.append(
+            f"{i}. {r['ticker']} | {r.get('trend_primary','-')} | "
+            f"Entry {ccy}{r['entry_low']:.2f}-{r['entry_high']:.2f} | "
+            f"Stop {ccy}{r['stop_loss']:.2f} | "
+            f"T1 {ccy}{r['target_1']:.2f} | "
+            f"T2 {ccy}{r['target_2']:.2f} | "
+            f"Exit {ccy}{r['recommended_exit']:.2f} | "
+            f"{tag} | {catalyst}"
+        )
+    lines.append("")
+    lines.append("Not investment advice.")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM SENDER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -521,21 +596,27 @@ def main():
         json.dump(orders, f, indent=2)
     print(f"\norders.json written -- {len(orders)} actionable setup(s)")
 
-    # Write ta_report.md
+    # Write ta_report.md — full detail rows + summary table at the end
     md = [
         f"# TA Entry Report -- {now_str}",
         "",
+        "## Full Analysis",
         "| Ticker | Price | Entry Zone | Stop | T1 (R/R) | Exit (R/R) | Verdict |",
         "|--------|-------|------------|------|----------|-----------|---------|",
     ]
     for r in results:
         md.append(format_markdown_row(r))
 
+    # Append summary table of actionable setups only
+    summary_md = format_summary_table(actionable, now_str, len(tickers))
+    if summary_md:
+        md.append(summary_md)
+
     with open("ta_report.md", "w") as f:
         f.write("\n".join(md))
     print("ta_report.md written")
 
-    # Send Telegram
+    # Send Telegram — individual cards + final summary table
     if actionable:
         send_telegram(
             f"TA Entry Runner -- {now_str}\n"
@@ -544,6 +625,8 @@ def main():
         )
         for r in actionable:
             send_telegram(format_telegram_card(r))
+        # Final summary message
+        send_telegram(format_summary_telegram(actionable, now_str, len(tickers)))
     else:
         send_telegram(
             f"TA Runner -- {now_str}\n"
