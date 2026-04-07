@@ -1,0 +1,89 @@
+name: Intraday Market Scanner
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schedule logic (all times UTC):
+#   Tokyo open:     00:00 UTC  (09:00 JST)
+#   Frankfurt open: 07:00 UTC  (08:00 CET / 09:00 CEST)
+#   London open:    08:00 UTC  (08:00 GMT / 09:00 BST)
+#   US pre-market:  12:00 UTC  (08:00 EST)
+#   US open:        13:30 UTC  (09:30 EST)
+#   US mid-session: 16:00 UTC  (12:00 EST)
+#   US close:       20:00 UTC  (16:00 EST)
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "0 0 * * 1-5"    # Tokyo open (Mon-Fri)
+    - cron: "0 7 * * 1-5"    # Frankfurt/EU open
+    - cron: "0 8 * * 1-5"    # London open
+    - cron: "30 13 * * 1-5"  # US market open (09:30 EST)
+    - cron: "0 16 * * 1-5"   # US mid-session (12:00 EST)
+    - cron: "0 20 * * 1-5"   # US close scan (16:00 EST)
+
+  workflow_dispatch:
+    inputs:
+      market:
+        description: "Market to scan (all / us / uk / de / jp)"
+        required: false
+        default: "all"
+        type: string
+      min_move_pct:
+        description: "Minimum target move % (default 5.0)"
+        required: false
+        default: "5.0"
+        type: string
+      dry_run:
+        description: "Dry run — print results, no Telegram"
+        required: false
+        default: "false"
+        type: boolean
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Detect active market from schedule
+        id: market_context
+        run: |
+          HOUR=$(date -u +%H)
+          MARKET="all"
+          if [ "$HOUR" = "00" ]; then MARKET="jp"; fi
+          if [ "$HOUR" = "07" ] || [ "$HOUR" = "08" ]; then MARKET="eu"; fi
+          if [ "$HOUR" = "13" ] || [ "$HOUR" = "16" ] || [ "$HOUR" = "20" ]; then MARKET="us"; fi
+          # Override with manual input if provided
+          INPUT="${{ github.event.inputs.market }}"
+          if [ -n "$INPUT" ] && [ "$INPUT" != "all" ]; then MARKET="$INPUT"; fi
+          echo "market=$MARKET" >> $GITHUB_OUTPUT
+          echo "Active market context: $MARKET"
+
+      - name: Run intraday scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          MARKET_CONTEXT:     ${{ steps.market_context.outputs.market }}
+          MIN_MOVE_PCT:       ${{ github.event.inputs.min_move_pct || '5.0' }}
+          DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scanner.py
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_number }}
+          path: "*.md"
+          retention-days: 7
