@@ -240,27 +240,34 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
 
 
 def passes_filters(m: dict, market: str) -> tuple:
-    """Return (passed, reason)."""
+    """
+    Return (passed, reason).
+    Volume and RVOL filters are ALWAYS enforced — low volume = illiquid = untradeable.
+    ATR and score filters only apply when MIN_MOVE_PCT > 0.
+    """
     vol   = m.get("volume", 0)
     score = m.get("score", 0)
     atr   = m.get("atr_pct", 0)
     rvol  = m.get("rvol", 0)
 
+    # ── Always enforced — liquidity gates ─────────────────────────────────────
     min_vol = 50_000 if market == "uk" else 100_000
     if vol < min_vol:
         return False, f"vol {vol:,} < {min_vol:,}"
 
-    if MIN_MOVE_PCT == 0:
-        if score < 20:
-            return False, f"score {score:.0f} < 20"
-        return True, "passed (no move threshold)"
-
-    if atr < MIN_MOVE_PCT * 0.7:
-        return False, f"ATR {atr:.2f}% < {MIN_MOVE_PCT*0.7:.2f}%"
     if rvol < 1.3:
         return False, f"RVOL {rvol:.2f}x < 1.3x"
-    if score < 35:
-        return False, f"score {score:.0f} < 35"
+
+    # ── Move threshold gates (only when target > 0) ───────────────────────────
+    if MIN_MOVE_PCT > 0:
+        if atr < MIN_MOVE_PCT * 0.7:
+            return False, f"ATR {atr:.2f}% < {MIN_MOVE_PCT*0.7:.2f}%"
+        if score < 35:
+            return False, f"score {score:.0f} < 35"
+    else:
+        # No move threshold — just need minimum score sanity check
+        if score < 20:
+            return False, f"score {score:.0f} < 20"
 
     return True, "passed"
 
