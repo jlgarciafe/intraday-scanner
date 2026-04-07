@@ -45,6 +45,9 @@ FEE_MODEL = {
     "uk": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
     "de": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
     "jp": {"commission_pct": 0.050, "spread_pct": 0.08,  "slippage_pct": 0.08},
+    "es": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "hk": {"commission_pct": 0.080, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "fr": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
 }
 
 # ── Ticker universe ────────────────────────────────────────────────────────────
@@ -71,6 +74,25 @@ TICKER_UNIVERSE = {
         "7203.T","9984.T","6758.T","6861.T","8306.T","9432.T","6501.T",
         "7974.T","4519.T","8316.T","6902.T","4661.T","9433.T","8035.T",
         "6954.T","7267.T","4543.T","2914.T","9020.T","4568.T",
+    ],
+    "es": [
+        # Ibex 35 — Spain (.MC)
+        "SAN.MC","BBVA.MC","ITX.MC","IBE.MC","REP.MC","TEF.MC","AMS.MC",
+        "ANA.MC","ELE.MC","CLNX.MC","FER.MC","GRF.MC","IAG.MC","MAP.MC",
+        "MEL.MC","MTS.MC","NTGY.MC","RED.MC","ROVI.MC","SAB.MC",
+    ],
+    "hk": [
+        # Hang Seng — Hong Kong (.HK)
+        "0700.HK","0005.HK","0939.HK","1299.HK","0941.HK","2318.HK","0388.HK",
+        "1398.HK","2628.HK","0003.HK","0011.HK","0002.HK","0016.HK","0027.HK",
+        "1810.HK","9988.HK","0175.HK","1177.HK","2020.HK","6862.HK",
+    ],
+    "fr": [
+        # CAC 40 — France (.PA)
+        "MC.PA","OR.PA","TTE.PA","SAN.PA","AIR.PA","BNP.PA","SU.PA","RI.PA",
+        "CAP.PA","ACA.PA","BN.PA","KER.PA","DG.PA","GLE.PA","HO.PA","LR.PA",
+        "ML.PA","ORA.PA","PUB.PA","RMS.PA","SAF.PA","SGO.PA","STLA.PA",
+        "STM.PA","SW.PA","VIE.PA","VIV.PA","WLN.PA","CS.PA","EDF.PA",
     ],
 }
 
@@ -325,13 +347,15 @@ def scan_market(market_key: str) -> list:
 
 def run_all_markets() -> list:
     if MARKET_CONTEXT == "all":
-        markets = ["us", "uk", "de", "jp"]
+        markets = ["us", "uk", "de", "jp", "es", "hk", "fr"]
     elif MARKET_CONTEXT == "eu":
-        markets = ["uk", "de"]
+        markets = ["uk", "de", "es", "fr"]
+    elif MARKET_CONTEXT == "asia":
+        markets = ["jp", "hk"]
     elif MARKET_CONTEXT in TICKER_UNIVERSE:
         markets = [MARKET_CONTEXT]
     else:
-        markets = ["us", "uk", "de", "jp"]
+        markets = ["us", "uk", "de", "jp", "es", "hk", "fr"]
 
     all_c = []
     for m in markets:
