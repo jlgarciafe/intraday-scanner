@@ -57,7 +57,9 @@ DRY_RUN            = os.getenv("DRY_RUN", "false").lower() == "true"
 OUTPUT_JSON        = os.getenv("OUTPUT_JSON", "scan_results.json")
 
 # ── Pre-screen thresholds ─────────────────────────────────────────────────────
-PRESCREEN_RVOL     = 1.5    # Minimum RVOL to pass pre-screen
+PRESCREEN_RVOL     = 1.2    # Minimum RVOL to pass pre-screen (lowered from 1.5)
+PRESCREEN_ATR      = 2.5    # ATR% floor — pass if ATR >= this even when RVOL < 1.2x
+                            # Gate logic: vol >= min AND (RVOL >= 1.2x OR ATR >= 2.5%)
 PRESCREEN_MIN_VOL  = {      # Minimum absolute volume per market
     "us": 500_000,
     "uk": 100_000,
@@ -502,11 +504,27 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
             avg_vol   = float(vols[:-1].mean()) if len(vols) > 1 else today_vol
             rvol      = today_vol / avg_vol if avg_vol > 0 else 1.0
 
-            if today_vol >= min_vol and rvol >= PRESCREEN_RVOL:
+            # Compute lightweight ATR% for the OR condition
+            atr_pct = 0.0
+            if "High" in df.columns and "Low" in df.columns and "Close" in df.columns:
+                h = df["High"].astype(float).values
+                l = df["Low"].astype(float).values
+                c = df["Close"].astype(float).values
+                if len(c) >= 2 and c[-1] > 0:
+                    trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
+                           for i in range(1, len(c))]
+                    atr_pct = (sum(trs) / len(trs)) / c[-1] * 100
+
+            # Gate: volume floor always required, then RVOL OR ATR
+            passes_rvol = rvol >= PRESCREEN_RVOL
+            passes_atr  = atr_pct >= PRESCREEN_ATR
+            if today_vol >= min_vol and (passes_rvol or passes_atr):
                 screened.append({
-                    "ticker": ticker,
-                    "rvol":   round(rvol, 2),
-                    "volume": int(today_vol),
+                    "ticker":  ticker,
+                    "rvol":    round(rvol, 2),
+                    "atr_pct": round(atr_pct, 2),
+                    "volume":  int(today_vol),
+                    "passed_by": "RVOL" if passes_rvol else "ATR",
                 })
 
         except Exception as e:
@@ -524,12 +542,15 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
     screened.sort(key=lambda x: x["rvol"], reverse=True)
 
     if screened:
+        by_rvol = sum(1 for s in screened if s["passed_by"] == "RVOL")
+        by_atr  = sum(1 for s in screened if s["passed_by"] == "ATR")
         logger.info(
-            f"  Pre-screen: {len(screened)} passed RVOL≥{PRESCREEN_RVOL}x "
-            f"from {len(tickers)} | Top: {screened[0]['ticker']} {screened[0]['rvol']}x"
+            f"  Pre-screen: {len(screened)} passed from {len(tickers)} "
+            f"(RVOL≥{PRESCREEN_RVOL}x: {by_rvol} | ATR≥{PRESCREEN_ATR}%: {by_atr}) "
+            f"| Top: {screened[0]['ticker']} RVOL={screened[0]['rvol']}x ATR={screened[0]['atr_pct']}%"
         )
     else:
-        logger.info(f"  Pre-screen: 0 passed from {len(tickers)} — market may be inactive")
+        logger.info(f"  Pre-screen: 0 passed from {len(tickers)} — market may be closed or inactive")
 
     if len(screened) > MAX_PRESCREEN_PASS:
         logger.info(f"  Capping at top {MAX_PRESCREEN_PASS} by RVOL for full analysis")
