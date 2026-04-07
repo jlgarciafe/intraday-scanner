@@ -80,12 +80,13 @@ FEE_MODEL = {
 
 # ── Global run stats ──────────────────────────────────────────────────────────
 _STATS = {
-    "universe_total": 0,
-    "prescreen_pass": 0,
-    "data_fail":      0,
-    "filtered":       0,
-    "candidates":     0,
-    "by_market":      {},
+    "universe_total":    0,
+    "errors":            0,   # tickers returning no data / delisted
+    "prescreen_pass":    0,
+    "data_fail":         0,
+    "filtered":          0,
+    "candidates":        0,
+    "by_market":         {},
 }
 
 
@@ -474,6 +475,7 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
 
     logger.info(f"  Pre-screening {len(tickers)} tickers for RVOL≥{PRESCREEN_RVOL}x...")
 
+    errors = 0
     for i, ticker in enumerate(tickers):
         try:
             raw = yf.download(
@@ -485,10 +487,12 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
                 timeout=10,
             )
             if raw is None or raw.empty or len(raw) < 3:
+                errors += 1
                 continue
 
             df = flatten_df(raw)
             if "Volume" not in df.columns:
+                errors += 1
                 continue
 
             vols      = df["Volume"].astype(float).values
@@ -504,13 +508,16 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
                 })
 
         except Exception as e:
+            errors += 1
             logger.debug(f"    {ticker}: prescreen error — {e}")
 
         # Progress log every 50 tickers
         if (i + 1) % 50 == 0:
-            logger.info(f"    Progress: {i+1}/{len(tickers)} checked | {len(screened)} passed so far")
+            logger.info(f"    Progress: {i+1}/{len(tickers)} checked | errors: {errors} | passed: {len(screened)}")
 
         time.sleep(0.15)
+
+    _STATS["errors"] += errors
 
     screened.sort(key=lambda x: x["rvol"], reverse=True)
 
@@ -720,6 +727,8 @@ def scan_market(market_key: str) -> list:
         time.sleep(0.2)
 
     # Accumulate stats
+    mkt_errors      = _STATS["errors"] - sum(s.get("errors",0) for s in _STATS["by_market"].values())
+    addressable     = len(universe) - mkt_errors
     _STATS["universe_total"] += len(universe)
     _STATS["prescreen_pass"] += len(prescreened)
     _STATS["data_fail"]      += data_fail
@@ -727,6 +736,8 @@ def scan_market(market_key: str) -> list:
     _STATS["candidates"]     += len(candidates)
     _STATS["by_market"][market_key.upper()] = {
         "universe":       len(universe),
+        "errors":         mkt_errors,
+        "addressable":    addressable,
         "prescreen_pass": len(prescreened),
         "data_fail":      data_fail,
         "filtered":       filtered,
@@ -764,22 +775,24 @@ def run_all_markets() -> list:
     all_c.sort(key=lambda x: x["score"], reverse=True)
 
     # Global summary
-    logger.info("\n" + "=" * 72)
+    total_errors      = _STATS["errors"]
+    total_addressable = _STATS["universe_total"] - total_errors
+    logger.info("\n" + "=" * 90)
     logger.info("GLOBAL SCAN SUMMARY")
-    logger.info("=" * 72)
-    logger.info(f"  {'Market':<8} {'Universe':>10} {'Pre-screen':>12} {'Failed':>8} {'Filtered':>10} {'Final':>8}")
-    logger.info(f"  {'-'*8} {'-'*10} {'-'*12} {'-'*8} {'-'*10} {'-'*8}")
+    logger.info("=" * 90)
+    logger.info(f"  {'Market':<8} {'Universe':>10} {'Errors':>8} {'Addressable':>13} {'Pre-screen':>12} {'Failed':>8} {'Filtered':>10} {'Final':>7}")
+    logger.info(f"  {'-'*8} {'-'*10} {'-'*8} {'-'*13} {'-'*12} {'-'*8} {'-'*10} {'-'*7}")
     for mkt, s in _STATS["by_market"].items():
         logger.info(
-            f"  {mkt:<8} {s['universe']:>10} {s['prescreen_pass']:>12} "
-            f"{s['data_fail']:>8} {s['filtered']:>10} {s['candidates']:>8}"
+            f"  {mkt:<8} {s['universe']:>10} {s.get('errors',0):>8} {s.get('addressable', s['universe']):>13} "
+            f"{s['prescreen_pass']:>12} {s['data_fail']:>8} {s['filtered']:>10} {s['candidates']:>7}"
         )
-    logger.info(f"  {'─'*8} {'─'*10} {'─'*12} {'─'*8} {'─'*10} {'─'*8}")
+    logger.info(f"  {'─'*8} {'─'*10} {'─'*8} {'─'*13} {'─'*12} {'─'*8} {'─'*10} {'─'*7}")
     logger.info(
-        f"  {'TOTAL':<8} {_STATS['universe_total']:>10} {_STATS['prescreen_pass']:>12} "
-        f"{_STATS['data_fail']:>8} {_STATS['filtered']:>10} {_STATS['candidates']:>8}"
+        f"  {'TOTAL':<8} {_STATS['universe_total']:>10} {total_errors:>8} {total_addressable:>13} "
+        f"{_STATS['prescreen_pass']:>12} {_STATS['data_fail']:>8} {_STATS['filtered']:>10} {_STATS['candidates']:>7}"
     )
-    logger.info("=" * 72)
+    logger.info("=" * 90)
 
     return all_c
 
@@ -825,21 +838,25 @@ def format_markdown(candidates: list) -> str:
 
     # Per-market breakdown table
     if stats_by_mkt:
+        total_errors      = _STATS.get("errors", 0)
+        total_addressable = _STATS["universe_total"] - total_errors
         lines += [
             "",
             "### Market Breakdown",
-            "| Market | Universe | Pre-screen | Failed | Filtered | Candidates |",
-            "|--------|----------|------------|--------|----------|------------|",
+            "| Market | Universe | Errors | Addressable | Pre-screen | Failed | Filtered | Candidates |",
+            "|--------|----------|--------|-------------|------------|--------|----------|------------|",
         ]
         for mkt, s in stats_by_mkt.items():
+            err  = s.get("errors", 0)
+            addr = s.get("addressable", s["universe"])
             lines.append(
-                f"| {mkt} | {s['universe']:,} | {s['prescreen_pass']} | "
+                f"| {mkt} | {s['universe']:,} | {err} | {addr:,} | {s['prescreen_pass']} | "
                 f"{s['data_fail']} | {s['filtered']} | {s['candidates']} |"
             )
         lines.append(
-            f"| **TOTAL** | **{_STATS['universe_total']:,}** | "
-            f"**{_STATS['prescreen_pass']}** | **{_STATS['data_fail']}** | "
-            f"**{_STATS['filtered']}** | **{_STATS['candidates']}** |"
+            f"| **TOTAL** | **{_STATS['universe_total']:,}** | **{total_errors}** | "
+            f"**{total_addressable:,}** | **{_STATS['prescreen_pass']}** | "
+            f"**{_STATS['data_fail']}** | **{_STATS['filtered']}** | **{_STATS['candidates']}** |"
         )
 
     return "\n".join(lines)
