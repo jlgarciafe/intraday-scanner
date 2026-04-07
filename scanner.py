@@ -94,24 +94,53 @@ _STATS = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_sp500() -> list:
-    """S&P 500 constituents from Wikipedia."""
+    """S&P 500 constituents — tries multiple sources."""
+    # Source 1: GitHub hosted CSV (reliable, no bot detection)
+    try:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        lines = r.text.strip().split("\n")
+        tickers = [l.split(",")[0].strip().replace(".", "-") for l in lines[1:] if l.strip()]
+        if len(tickers) > 400:
+            logger.info(f"  S&P 500: {len(tickers)} constituents fetched (GitHub CSV)")
+            return tickers
+    except Exception as e:
+        logger.debug(f"  S&P 500 GitHub CSV failed: {e}")
+
+    # Source 2: Wikipedia with browser headers
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
+        tables = pd.read_html(
+            requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=15).text
+        )
         df = tables[0]
         tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        logger.info(f"  S&P 500: {len(tickers)} constituents fetched")
+        logger.info(f"  S&P 500: {len(tickers)} constituents fetched (Wikipedia)")
         return tickers
     except Exception as e:
-        logger.warning(f"  S&P 500 fetch failed: {e} — using fallback")
+        logger.warning(f"  S&P 500 all sources failed: {e} — using fallback")
         return _sp500_fallback()
+
+
+def _wiki_tables(url: str) -> list:
+    """Fetch Wikipedia tables with browser headers to avoid 403."""
+    try:
+        html = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=15,
+        ).text
+        return pd.read_html(html)
+    except Exception as e:
+        raise RuntimeError(f"Wikipedia fetch failed: {e}")
 
 
 def fetch_ftse100() -> list:
     """FTSE 100 constituents from Wikipedia."""
     try:
         url = "https://en.wikipedia.org/wiki/FTSE_100_Index"
-        tables = pd.read_html(url)
+        tables = _wiki_tables(url)
         # Find the table with ticker column
         for t in tables:
             cols = [c.lower() for c in t.columns]
@@ -307,83 +336,63 @@ def flatten_df(raw: pd.DataFrame) -> pd.DataFrame:
 def prescreen_volume(tickers: list, market_key: str) -> list:
     """
     Lightweight volume pre-screen across all index constituents.
-    Fetches only 5 days of data per ticker — fast.
+    Downloads 5 days of data per ticker individually (batch MultiIndex is unreliable).
     Returns tickers sorted by RVOL descending, capped at MAX_PRESCREEN_PASS.
-    
-    Logic: today's volume vs 4-day average.
     RVOL > PRESCREEN_RVOL = elevated interest = worth full analysis.
     """
     min_vol  = PRESCREEN_MIN_VOL.get(market_key, 50_000)
     screened = []
-    batch_size = 20  # yfinance handles batches well
 
-    logger.info(f"  Pre-screening {len(tickers)} tickers for elevated volume...")
+    logger.info(f"  Pre-screening {len(tickers)} tickers for RVOL≥{PRESCREEN_RVOL}x...")
 
-    # Process in batches for speed
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i+batch_size]
+    for i, ticker in enumerate(tickers):
         try:
             raw = yf.download(
-                batch,
+                ticker,
                 period="5d",
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
-                timeout=20,
-                group_by="ticker",
+                timeout=10,
             )
-            if raw is None or raw.empty:
+            if raw is None or raw.empty or len(raw) < 3:
                 continue
 
-            for ticker in batch:
-                try:
-                    # Extract single ticker from batch download
-                    if len(batch) == 1:
-                        df = flatten_df(raw.copy())
-                    else:
-                        if ticker not in raw.columns.get_level_values(0):
-                            continue
-                        df = raw[ticker].copy()
-                        df = df.loc[:, ~df.columns.duplicated()]
+            df = flatten_df(raw)
+            if "Volume" not in df.columns:
+                continue
 
-                    if df is None or len(df) < 3:
-                        continue
-                    if "Volume" not in df.columns or "Close" not in df.columns:
-                        continue
+            vols      = df["Volume"].astype(float).values
+            today_vol = float(vols[-1])
+            avg_vol   = float(vols[:-1].mean()) if len(vols) > 1 else today_vol
+            rvol      = today_vol / avg_vol if avg_vol > 0 else 1.0
 
-                    vols = df["Volume"].astype(float).values
-                    if len(vols) < 3:
-                        continue
-
-                    today_vol = float(vols[-1])
-                    avg_vol   = float(vols[:-1].mean()) if len(vols) > 1 else today_vol
-                    rvol      = today_vol / avg_vol if avg_vol > 0 else 1.0
-
-                    if today_vol >= min_vol and rvol >= PRESCREEN_RVOL:
-                        screened.append({
-                            "ticker": ticker,
-                            "rvol":   round(rvol, 2),
-                            "volume": int(today_vol),
-                        })
-                except Exception:
-                    continue
+            if today_vol >= min_vol and rvol >= PRESCREEN_RVOL:
+                screened.append({
+                    "ticker": ticker,
+                    "rvol":   round(rvol, 2),
+                    "volume": int(today_vol),
+                })
 
         except Exception as e:
-            logger.debug(f"  Batch {i//batch_size + 1} error: {e}")
+            logger.debug(f"    {ticker}: prescreen error — {e}")
 
-        time.sleep(0.3)
+        # Progress log every 50 tickers
+        if (i + 1) % 50 == 0:
+            logger.info(f"    Progress: {i+1}/{len(tickers)} checked | {len(screened)} passed so far")
 
-    # Sort by RVOL descending — highest conviction first
+        time.sleep(0.15)
+
     screened.sort(key=lambda x: x["rvol"], reverse=True)
 
-    logger.info(
-        f"  Pre-screen complete: {len(screened)} passed RVOL≥{PRESCREEN_RVOL}x "
-        f"from {len(tickers)} | Top RVOL: "
-        f"{screened[0]['ticker']} {screened[0]['rvol']}x" if screened else
-        f"  Pre-screen complete: 0 passed from {len(tickers)}"
-    )
+    if screened:
+        logger.info(
+            f"  Pre-screen: {len(screened)} passed RVOL≥{PRESCREEN_RVOL}x "
+            f"from {len(tickers)} | Top: {screened[0]['ticker']} {screened[0]['rvol']}x"
+        )
+    else:
+        logger.info(f"  Pre-screen: 0 passed from {len(tickers)} — market may be inactive")
 
-    # Cap at MAX_PRESCREEN_PASS for full analysis
     if len(screened) > MAX_PRESCREEN_PASS:
         logger.info(f"  Capping at top {MAX_PRESCREEN_PASS} by RVOL for full analysis")
         screened = screened[:MAX_PRESCREEN_PASS]
