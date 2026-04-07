@@ -250,10 +250,139 @@ def fetch_hangseng() -> list:
         return _hangseng_fallback()
 
 
+def fetch_nasdaq_supplement() -> list:
+    """
+    Top ~300 liquid NASDAQ stocks NOT in S&P 500.
+    Focused on high-beta: tech, biotech, crypto-adjacent, AI, leveraged ETFs.
+    These are the stocks where 5%+ intraday moves happen regularly.
+    """
+    # Leveraged & inverse ETFs — extremely high ATR, always relevant
+    leveraged_etfs = [
+        "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","LABU","LABD",
+        "SOXL","SOXS","TNA","TZA","FAS","FAZ","FNGU","FNGD",
+        "UVXY","SVXY","VIXY","TVIX","TECL","TECS","CURE","ERX",
+        "ERY","GUSH","DRIP","BOIL","KOLD","DUST","NUGT","JNUG",
+    ]
+    # High-beta NASDAQ tech & AI (not in S&P 500)
+    nasdaq_tech = [
+        "NVDA","AMD","TSLA","META","NFLX","COIN","MSTR","PLTR","SNOW",
+        "RBLX","ARM","DDOG","CRWD","NET","ZS","OKTA","GTLB","BILL","HUBS",
+        "MNDY","CFLT","AFRM","HOOD","SOFI","LCID","RIVN","NIO","XPEV","LI",
+        "SMCI","MRVL","QCOM","TXN","LRCX","KLAC","AMAT","ASML","ONTO",
+        "WOLF","AEHR","AMBA","INDI","MPWR","SLAB","SITM","ALGM","PSIX",
+    ]
+    # Biotech / pharma — high event-driven volatility
+    nasdaq_biotech = [
+        "MRNA","BNTX","REGN","BIIB","VRTX","ILMN","SGEN","INCY","BMRN",
+        "ALNY","IONS","SRPT","RARE","FOLD","AKRO","MDGL","VKTX","RYTM",
+        "CRSP","BEAM","EDIT","NTLA","VERV","BLUE","FATE","KYMR","IMVT",
+        "ARQT","PRAX","RETA","DAWN","ROIV","SAVA","IOVA","NKTR","ADMA",
+        "AXSM","ACAD","SAGE","INVA","PTCT","EXEL","MGNX","TGTX","ITCI",
+    ]
+    # Crypto / fintech / speculative
+    nasdaq_speculative = [
+        "MARA","RIOT","CLSK","CIFR","HUT","BTBT","BITF","WGMI",
+        "PYPL","SQ","AFRM","UPST","LC","OPEN","OPAD","PRPB",
+        "CLOV","WKHS","NKLA","GOEV","HYLN","FSR","MULN","BLNK",
+    ]
+    # High-momentum mid-caps with frequent big moves
+    nasdaq_momentum = [
+        "SHOP","UBER","LYFT","ABNB","DASH","SNAP","PINS","TWLO",
+        "ZM","DOCN","DBX","BOX","BAND","FSLY","ESTC","MDB","COUCHBASE",
+        "APPN","NCNO","TOST","BRZE","TASK","PWSC","SMAR","ALTR","JAMF",
+        "DUOL","COUR","UDMY","SEMR","SPRK","WEAV","PCVX","CRNX",
+        "ACVA","ACMR","CDAY","JAMF","KNSL","RYAN","PCTY","PAYC",
+    ]
+
+    all_nasdaq = (leveraged_etfs + nasdaq_tech + nasdaq_biotech +
+                  nasdaq_speculative + nasdaq_momentum)
+    # Deduplicate
+    seen = set()
+    unique = []
+    for t in all_nasdaq:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+
+    logger.info(f"  NASDAQ supplement: {len(unique)} tickers")
+    return unique
+
+
+def fetch_russell_curated() -> list:
+    """
+    Curated Russell 2000 high-volatility names.
+    Full Russell 2000 (2000 tickers) would take too long — this targets
+    the highest-beta, most liquid small-caps where intraday moves of
+    5-15%+ are common, especially on earnings and news catalysts.
+    ~150 tickers covering: biotech, mining, energy, fintech, speculative tech.
+    """
+    russell_biotech = [
+        "ACLS","ACNB","ADPT","ADUS","AGIO","AGTC","AKBA","AKRO","ALDX",
+        "ALEC","ALGS","ALLO","ALPN","ALRS","ALTO","ALVR","AMGN","AMPH",
+        "ANAB","ANIK","APLT","APOG","APRE","APTX","ARCT","ARDX","ARGT",
+        "ARHS","ARMP","AROW","ARRY","ARTL","ARVN","ASND","ASRT","ATAI",
+        "ATEC","ATEX","ATNI","ATRC","ATRS","ATVI","ATUS","AUPH","AURA",
+        "AVDL","AVEO","AVIR","AVNS","AVRO","AVXL","AXNX","AYTU","AZTA",
+    ]
+    russell_energy_mining = [
+        "AMR","ARCH","BTU","CEIX","CONSOL","ARLP","FELP","FANG","PDCE",
+        "REI","REPX","RRC","SM","SBOW","TALO","VTLE","WTI","GPOR",
+        "SWN","RKT","MTDR","CHRD","CIVI","BATL","ESTE","MNRL","NOG",
+        "PHX","PPSI","SPRO","STNG","TRMD","TNK","DHT","EURN","FRO",
+        "NMM","GOGL","SBLK","SALT","SHIP","TOPS","FREE","GNK","HSHP",
+    ]
+    russell_fintech_spec = [
+        "ATLC","ENVA","EZCORP","FCFS","GPMT","HFBL","HIFS","HMNF",
+        "ITIC","LMST","LNDC","LOAN","MBCN","MBIN","MFIN","MOFG",
+        "NBTB","NKSH","NRIM","NWIN","OBNK","OCFC","OCSL","OPBK",
+        "OPHC","OPOF","ORRF","OSBC","OVBC","OVLY","PBAM","PBFS",
+        "CURO","PRAA","QD","QFIN","TREE","UWMC","GHLD","PFSI",
+    ]
+    russell_spec_tech = [
+        "ACMR","AIOT","ALIT","ALLT","ALRM","ALRS","ALTI","ALTG",
+        "ALTM","ALTR","ALTU","ALTV","ALVR","ALXO","ALYA","AMAM",
+        "AMBC","AMBI","AMBO","AMCX","AMEH","AMED","AMIX","AMKR",
+        "BFLY","BIGC","BLZE","BRSP","BTRS","BZFD","CABA","CELU",
+        "CENN","CERE","CERT","CGEM","CHDN","CHGG","CHPT","CIFR",
+        "CLOV","CLPT","CLRB","CLRO","CLSK","CLST","CLVS","CLXT",
+        "CMPS","CNCE","CNDT","CNET","CNFN","CNMD","CNOB","CNSL",
+        "CODA","CODX","COEP","COFS","COIN","COLB","COLI","COLL",
+    ]
+
+    all_russell = (russell_biotech + russell_energy_mining +
+                   russell_fintech_spec + russell_spec_tech)
+    seen = set()
+    unique = [t for t in all_russell if not (t in seen or seen.add(t))]
+    logger.info(f"  Russell 2000 curated: {len(unique)} tickers")
+    return unique
+
+
 def get_universe(market_key: str) -> list:
-    """Fetch full index universe for a market. Falls back to static list."""
+    """
+    Fetch full index universe for a market.
+    US combines S&P 500 + NASDAQ supplement + Russell 2000 curated.
+    Other markets fetch official index constituents from Wikipedia.
+    Falls back to static lists if fetch fails.
+    """
+    if market_key == "us":
+        sp500   = fetch_sp500()
+        nasdaq  = fetch_nasdaq_supplement()
+        russell = fetch_russell_curated()
+        # Combine and deduplicate — S&P 500 is authoritative, others supplement
+        sp500_set = set(sp500)
+        combined  = sp500[:]
+        for t in nasdaq + russell:
+            if t not in sp500_set:
+                combined.append(t)
+                sp500_set.add(t)
+        logger.info(
+            f"  US total universe: {len(combined)} "
+            f"(S&P500={len(sp500)} + NASDAQ_supp={sum(1 for t in nasdaq if t not in set(sp500))} "
+            f"+ Russell_curated={sum(1 for t in russell if t not in set(sp500) and t not in set(nasdaq))})"
+        )
+        return combined
+
     fetchers = {
-        "us": fetch_sp500,
         "uk": fetch_ftse100,
         "de": fetch_dax,
         "jp": fetch_nikkei225,
