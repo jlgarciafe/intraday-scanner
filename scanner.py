@@ -308,6 +308,10 @@ def net_yield(gross_pct: float, market: str) -> float:
 #  SCANNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Global stats accumulated across all markets in a run
+_STATS = {"scanned": 0, "data_fail": 0, "filtered": 0, "candidates": 0, "by_market": {}}
+
+
 def scan_market(market_key: str) -> list:
     tickers = TICKER_UNIVERSE.get(market_key, [])
     if not tickers:
@@ -341,11 +345,26 @@ def scan_market(market_key: str) -> list:
 
     logger.info(f"\n{market_key.upper()}: scanned={len(tickers)} | "
                 f"data_fail={data_fail} | filtered={filtered} | candidates={len(candidates)}")
+
+    # Accumulate into global stats
+    _STATS["scanned"]    += len(tickers)
+    _STATS["data_fail"]  += data_fail
+    _STATS["filtered"]   += filtered
+    _STATS["candidates"] += len(candidates)
+    _STATS["by_market"][market_key.upper()] = {
+        "scanned": len(tickers), "data_fail": data_fail,
+        "filtered": filtered,    "candidates": len(candidates),
+    }
+
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates
 
 
 def run_all_markets() -> list:
+    # Reset stats for this run
+    _STATS.update({"scanned": 0, "data_fail": 0, "filtered": 0,
+                   "candidates": 0, "by_market": {}})
+
     if MARKET_CONTEXT == "all":
         markets = ["us", "uk", "de", "jp", "es", "hk", "fr"]
     elif MARKET_CONTEXT == "eu":
@@ -361,6 +380,21 @@ def run_all_markets() -> list:
     for m in markets:
         all_c.extend(scan_market(m))
     all_c.sort(key=lambda x: x["score"], reverse=True)
+
+    # Print global summary table
+    logger.info("\n" + "=" * 62)
+    logger.info("GLOBAL SCAN SUMMARY")
+    logger.info("=" * 62)
+    logger.info(f"  {'Market':<8} {'Scanned':>8} {'Failed':>8} {'Filtered':>10} {'Candidates':>12}")
+    logger.info(f"  {'-'*8} {'-'*8} {'-'*8} {'-'*10} {'-'*12}")
+    for mkt, s in _STATS["by_market"].items():
+        logger.info(f"  {mkt:<8} {s['scanned']:>8} {s['data_fail']:>8} "
+                    f"{s['filtered']:>10} {s['candidates']:>12}")
+    logger.info(f"  {'─'*8} {'─'*8} {'─'*8} {'─'*10} {'─'*12}")
+    logger.info(f"  {'TOTAL':<8} {_STATS['scanned']:>8} {_STATS['data_fail']:>8} "
+                f"{_STATS['filtered']:>10} {_STATS['candidates']:>12}")
+    logger.info("=" * 62)
+
     return all_c
 
 
