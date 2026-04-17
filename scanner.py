@@ -41,6 +41,7 @@ import requests
 import pandas as pd
 import warnings
 warnings.filterwarnings("ignore")
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datetime import datetime, timezone
 from typing import Optional
@@ -78,6 +79,11 @@ PRESCREEN_MIN_VOL  = {      # Minimum absolute volume per market (stock tier)
     "fr": 50_000,
 }
 MAX_PRESCREEN_PASS = 60     # Max stocks to run full analysis on per market
+
+# ── Parallelism ───────────────────────────────────────────────────────────────
+PRESCREEN_BATCH_SIZE  = 100  # tickers per yf.download() batch call
+MAX_WORKERS_PRESCREEN = 5    # parallel batch workers for pre-screen
+MAX_WORKERS_ANALYSIS  = 15   # parallel workers for full analysis
 
 # ── Tier configuration ────────────────────────────────────────────────────────
 # Each tier has its own pre-screen and filter thresholds.
@@ -543,6 +549,70 @@ def flatten_df(raw: pd.DataFrame) -> pd.DataFrame:
     return raw.loc[:, ~raw.columns.duplicated()]
 
 
+def _prescreen_batch(batch: list, rvol_thr: float, atr_thr: float, min_vol: int) -> tuple:
+    """
+    Download and screen one batch of tickers via a single yf.download() call.
+    Returns (list_of_passed_dicts, error_count).
+    """
+    passed = []
+    errors = 0
+    try:
+        if len(batch) == 1:
+            raw = yf.download(batch[0], period="5d", interval="1d",
+                              auto_adjust=True, progress=False, timeout=30)
+            if raw is None or raw.empty:
+                return passed, 1
+            ticker_dfs = {batch[0]: flatten_df(raw)}
+        else:
+            raw = yf.download(batch, period="5d", interval="1d",
+                              auto_adjust=True, progress=False, timeout=30,
+                              group_by="ticker")
+            ticker_dfs = {}
+            for ticker in batch:
+                try:
+                    df = raw[ticker].dropna(how="all")
+                    if len(df) >= 3:
+                        ticker_dfs[ticker] = df
+                except (KeyError, TypeError):
+                    errors += 1
+    except Exception:
+        return passed, len(batch)
+
+    for ticker, df in ticker_dfs.items():
+        try:
+            if "Volume" not in df.columns:
+                continue
+            vols      = df["Volume"].astype(float).values
+            today_vol = float(vols[-1])
+            avg_vol   = float(vols[:-1].mean()) if len(vols) > 1 else today_vol
+            rvol      = today_vol / avg_vol if avg_vol > 0 else 1.0
+
+            atr_pct = 0.0
+            if all(c in df.columns for c in ["High", "Low", "Close"]):
+                h = df["High"].astype(float).values
+                l = df["Low"].astype(float).values
+                c = df["Close"].astype(float).values
+                if len(c) >= 2 and c[-1] > 0:
+                    trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
+                           for i in range(1, len(c))]
+                    atr_pct = (sum(trs) / len(trs)) / c[-1] * 100
+
+            passes_rvol = rvol >= rvol_thr
+            passes_atr  = atr_pct >= atr_thr
+            if today_vol >= min_vol and (passes_rvol or passes_atr):
+                passed.append({
+                    "ticker":    ticker,
+                    "rvol":      round(rvol, 2),
+                    "atr_pct":   round(atr_pct, 2),
+                    "volume":    int(today_vol),
+                    "passed_by": "RVOL" if passes_rvol else "ATR",
+                })
+        except Exception:
+            errors += 1
+
+    return passed, errors
+
+
 def prescreen_volume(
     tickers: list,
     market_key: str,
@@ -552,81 +622,29 @@ def prescreen_volume(
     max_pass: int = None,
 ) -> list:
     """
-    Lightweight volume pre-screen across all index constituents.
-    Downloads 5 days of data per ticker individually (batch MultiIndex is unreliable).
-    Returns tickers sorted by RVOL descending, capped at max_pass.
-
-    Optional overrides allow tier-specific thresholds (ETF/Futures) without
-    changing the stock-tier defaults.
+    Batch + parallel pre-screen. Splits tickers into batches of PRESCREEN_BATCH_SIZE,
+    downloads each batch in a single yf.download() call, runs MAX_WORKERS_PRESCREEN
+    batches concurrently. ~10x faster than sequential single-ticker downloads.
     """
     rvol_thr = rvol_threshold if rvol_threshold is not None else PRESCREEN_RVOL
     atr_thr  = atr_threshold  if atr_threshold  is not None else PRESCREEN_ATR
     min_vol  = min_vol_override if min_vol_override is not None else PRESCREEN_MIN_VOL.get(market_key, 50_000)
     cap      = max_pass if max_pass is not None else MAX_PRESCREEN_PASS
+
+    logger.info(f"  Pre-screening {len(tickers)} tickers (batch={PRESCREEN_BATCH_SIZE}, workers={MAX_WORKERS_PRESCREEN})...")
+
+    batches  = [tickers[i:i+PRESCREEN_BATCH_SIZE] for i in range(0, len(tickers), PRESCREEN_BATCH_SIZE)]
     screened = []
+    errors   = 0
 
-    logger.info(f"  Pre-screening {len(tickers)} tickers for RVOL>={rvol_thr}x / ATR>={atr_thr}%...")
-
-    errors = 0
-    for i, ticker in enumerate(tickers):
-        try:
-            raw = yf.download(
-                ticker,
-                period="5d",
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                timeout=10,
-            )
-            if raw is None or raw.empty or len(raw) < 3:
-                errors += 1
-                continue
-
-            df = flatten_df(raw)
-            if "Volume" not in df.columns:
-                errors += 1
-                continue
-
-            vols      = df["Volume"].astype(float).values
-            today_vol = float(vols[-1])
-            avg_vol   = float(vols[:-1].mean()) if len(vols) > 1 else today_vol
-            rvol      = today_vol / avg_vol if avg_vol > 0 else 1.0
-
-            # Lightweight ATR for the OR gate
-            atr_pct = 0.0
-            if "High" in df.columns and "Low" in df.columns and "Close" in df.columns:
-                h = df["High"].astype(float).values
-                l = df["Low"].astype(float).values
-                c = df["Close"].astype(float).values
-                if len(c) >= 2 and c[-1] > 0:
-                    trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
-                           for i in range(1, len(c))]
-                    atr_pct = (sum(trs) / len(trs)) / c[-1] * 100
-
-            # Gate: volume floor always required, then RVOL OR ATR
-            passes_rvol = rvol >= rvol_thr
-            passes_atr  = atr_pct >= atr_thr
-            if today_vol >= min_vol and (passes_rvol or passes_atr):
-                screened.append({
-                    "ticker":    ticker,
-                    "rvol":      round(rvol, 2),
-                    "atr_pct":   round(atr_pct, 2),
-                    "volume":    int(today_vol),
-                    "passed_by": "RVOL" if passes_rvol else "ATR",
-                })
-
-        except Exception as e:
-            errors += 1
-            logger.debug(f"    {ticker}: prescreen error — {e}")
-
-        # Progress log every 50 tickers
-        if (i + 1) % 50 == 0:
-            logger.info(f"    Progress: {i+1}/{len(tickers)} checked | errors: {errors} | passed: {len(screened)}")
-
-        time.sleep(0.15)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_PRESCREEN) as ex:
+        futures = {ex.submit(_prescreen_batch, b, rvol_thr, atr_thr, min_vol): b for b in batches}
+        for fut in as_completed(futures):
+            batch_passed, batch_errors = fut.result()
+            screened.extend(batch_passed)
+            errors   += batch_errors
 
     _STATS["errors"] += errors
-
     screened.sort(key=lambda x: x["rvol"], reverse=True)
 
     if screened:
@@ -668,8 +686,16 @@ def fetch_snapshot(ticker: str) -> Optional[pd.DataFrame]:
             return df
         except Exception as e:
             logger.debug(f"    {ticker}: fetch error — {e}")
-        time.sleep(0.3)
     return None
+
+
+def _fetch_and_analyse(ticker: str) -> tuple:
+    """Fetch + analyse one ticker. Returns (ticker, metrics_dict_or_None)."""
+    df = fetch_snapshot(ticker)
+    if df is None:
+        return ticker, None
+    m = analyse_ticker(ticker, df)
+    return ticker, m if m else None
 
 
 def compute_atr(df: pd.DataFrame, period: int = 10) -> float:
@@ -831,35 +857,28 @@ def scan_tier(tier_name: str, universe: list) -> list:
         _STATS["universe_total"] += len(universe)
         return []
 
-    logger.info(f"\n  Full analysis on {len(prescreened)} pre-screened {tier_name}s:")
+    logger.info(f"\n  Full analysis on {len(prescreened)} pre-screened {tier_name}s (parallel, workers={MAX_WORKERS_ANALYSIS}):")
     candidates, data_fail, filtered = [], 0, 0
 
-    for i, ticker in enumerate(prescreened, 1):
-        logger.info(f"  [{i}/{len(prescreened)}] {ticker}")
-        df = fetch_snapshot(ticker)
-        if df is None:
-            data_fail += 1
-            continue
-
-        m = analyse_ticker(ticker, df)
-        if not m:
-            data_fail += 1
-            continue
-
-        passed, reason = passes_filters(m, market="us", tier=tier_name)
-        if not passed:
-            logger.info(f"    {ticker}: ❌ {reason}")
-            filtered += 1
-            continue
-
-        logger.info(f"    {ticker}: ✅ CANDIDATE")
-        candidates.append({
-            **m,
-            "tier":      tier_name,
-            "market":    "GLOBAL",
-            "net_yield": net_yield(m["atr_pct"], market="us", tier=tier_name),
-        })
-        time.sleep(0.2)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_ANALYSIS) as ex:
+        futures = {ex.submit(_fetch_and_analyse, t): t for t in prescreened}
+        for fut in as_completed(futures):
+            ticker, m = fut.result()
+            if m is None:
+                data_fail += 1
+                continue
+            passed, reason = passes_filters(m, market="us", tier=tier_name)
+            if not passed:
+                logger.info(f"    {ticker}: FAIL {reason}")
+                filtered += 1
+                continue
+            logger.info(f"    {ticker}: CANDIDATE")
+            candidates.append({
+                **m,
+                "tier":      tier_name,
+                "market":    "GLOBAL",
+                "net_yield": net_yield(m["atr_pct"], market="us", tier=tier_name),
+            })
 
     _STATS["universe_total"] += len(universe)
     _STATS["prescreen_pass"] += len(prescreened)
@@ -906,37 +925,30 @@ def scan_market(market_key: str) -> list:
         _STATS["universe_total"] += len(universe)
         return []
 
-    logger.info(f"\n  Full analysis on {len(prescreened)} pre-screened stocks:")
+    logger.info(f"\n  Full analysis on {len(prescreened)} pre-screened stocks (parallel, workers={MAX_WORKERS_ANALYSIS}):")
 
-    # Stage 3: Full analysis
+    # Stage 3: Full analysis — parallel
     candidates, data_fail, filtered = [], 0, 0
 
-    for i, ticker in enumerate(prescreened, 1):
-        logger.info(f"  [{i}/{len(prescreened)}] {ticker}")
-        df = fetch_snapshot(ticker)
-        if df is None:
-            data_fail += 1
-            continue
-
-        m = analyse_ticker(ticker, df)
-        if not m:
-            data_fail += 1
-            continue
-
-        passed, reason = passes_filters(m, market_key, tier="stock")
-        if not passed:
-            logger.info(f"    {ticker}: ❌ {reason}")
-            filtered += 1
-            continue
-
-        logger.info(f"    {ticker}: ✅ CANDIDATE")
-        candidates.append({
-            **m,
-            "tier":      "stock",
-            "market":    market_key.upper(),
-            "net_yield": net_yield(m["atr_pct"], market_key, tier="stock"),
-        })
-        time.sleep(0.2)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_ANALYSIS) as ex:
+        futures = {ex.submit(_fetch_and_analyse, t): t for t in prescreened}
+        for fut in as_completed(futures):
+            ticker, m = fut.result()
+            if m is None:
+                data_fail += 1
+                continue
+            passed, reason = passes_filters(m, market_key, tier="stock")
+            if not passed:
+                logger.info(f"    {ticker}: FAIL {reason}")
+                filtered += 1
+                continue
+            logger.info(f"    {ticker}: CANDIDATE")
+            candidates.append({
+                **m,
+                "tier":      "stock",
+                "market":    market_key.upper(),
+                "net_yield": net_yield(m["atr_pct"], market_key, tier="stock"),
+            })
 
     # Accumulate stats
     mkt_errors      = _STATS["errors"] - sum(s.get("errors",0) for s in _STATS["by_market"].values())
