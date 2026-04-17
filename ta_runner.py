@@ -351,10 +351,13 @@ def format_best_opportunities_summary(top10: list, total_actionable: int, total_
         f"Ranked by entry quality | {total_actionable} actionable from {total_scanned} scanned",
         f"",
     ]
+    def _short(name, max_len=25):
+        return name if len(name) <= max_len else name[:max_len - 1] + "…"
+
     verdict_tag = lambda v: "✅ ENTER" if v.startswith("ENTER") else ("⏳ DIP" if v.startswith("WAIT FOR DIP") else "⏳ BRKOUT")
     for i, r in enumerate(top10, 1):
         sym    = r.get("ticker", "?")
-        name   = r.get("name", sym)
+        name   = _short(r.get("name", sym))
         trend  = r.get("trend_primary", "-")
         rsi    = r.get("rsi", "-")
         tag    = verdict_tag(r.get("verdict", ""))
