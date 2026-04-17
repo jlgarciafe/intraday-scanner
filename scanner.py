@@ -1097,12 +1097,6 @@ def format_telegram(candidates: list) -> str:
         "",
     ]
 
-    etfs        = tier_sort([c for c in candidates if c.get("tier") == "etf"])
-    futures     = tier_sort([c for c in candidates if c.get("tier") == "future"])
-    stocks      = [c for c in candidates if c.get("tier", "stock") == "stock"]
-    quality     = tier_sort([c for c in stocks if not _is_speculative(c)])
-    speculative = tier_sort([c for c in stocks if     _is_speculative(c)])
-
     def tier_sort(lst):
         """Sort by repeat_days desc first, then score desc — repeaters bubble up."""
         return sorted(lst, key=lambda x: (x.get("repeat_days", 0), x["score"]), reverse=True)
@@ -1116,6 +1110,12 @@ def format_telegram(candidates: list) -> str:
             f"{i}. [{label}] <b>{c['ticker']}</b>{flag} {e}{c['day_return']:+.1f}% | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
+
+    etfs        = tier_sort([c for c in candidates if c.get("tier") == "etf"])
+    futures     = tier_sort([c for c in candidates if c.get("tier") == "future"])
+    stocks      = [c for c in candidates if c.get("tier", "stock") == "stock"]
+    quality     = tier_sort([c for c in stocks if not _is_speculative(c)])
+    speculative = tier_sort([c for c in stocks if     _is_speculative(c)])
 
     n = 1
     lines.append("🏦 <b>TOP ETFs</b>")
