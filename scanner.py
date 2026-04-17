@@ -62,6 +62,7 @@ MARKET_CONTEXT     = os.getenv("MARKET_CONTEXT", "all").lower()
 MIN_MOVE_PCT       = float(os.getenv("MIN_MOVE_PCT", "5.0"))
 DRY_RUN            = os.getenv("DRY_RUN", "false").lower() == "true"
 OUTPUT_JSON        = os.getenv("OUTPUT_JSON", "scan_results.json")
+HISTORY_FILE       = os.getenv("HISTORY_FILE", "scan_history.json")
 
 # ── Pre-screen thresholds (stock tier defaults) ───────────────────────────────
 PRESCREEN_RVOL     = 1.2    # Minimum RVOL to pass pre-screen (lowered from 1.5)
@@ -1096,17 +1097,23 @@ def format_telegram(candidates: list) -> str:
         "",
     ]
 
-    etfs        = sorted([c for c in candidates if c.get("tier") == "etf"],    key=lambda x: x["score"], reverse=True)
-    futures     = sorted([c for c in candidates if c.get("tier") == "future"], key=lambda x: x["score"], reverse=True)
+    etfs        = tier_sort([c for c in candidates if c.get("tier") == "etf"])
+    futures     = tier_sort([c for c in candidates if c.get("tier") == "future"])
     stocks      = [c for c in candidates if c.get("tier", "stock") == "stock"]
-    quality     = sorted([c for c in stocks if not _is_speculative(c)], key=lambda x: x["score"], reverse=True)
-    speculative = sorted([c for c in stocks if     _is_speculative(c)], key=lambda x: x["score"], reverse=True)
+    quality     = tier_sort([c for c in stocks if not _is_speculative(c)])
+    speculative = tier_sort([c for c in stocks if     _is_speculative(c)])
+
+    def tier_sort(lst):
+        """Sort by repeat_days desc first, then score desc — repeaters bubble up."""
+        return sorted(lst, key=lambda x: (x.get("repeat_days", 0), x["score"]), reverse=True)
 
     def fmt(c: dict, i: int) -> str:
-        e = "🟢" if c["day_return"] > 0 else "🔴"
+        e     = "🟢" if c["day_return"] > 0 else "🔴"
         label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
+        rpt   = c.get("repeat_days", 0)
+        flag  = f" 🔁{rpt}d" if rpt >= 2 else ""
         return (
-            f"{i}. [{label}] <b>{c['ticker']}</b> {e}{c['day_return']:+.1f}% | "
+            f"{i}. [{label}] <b>{c['ticker']}</b>{flag} {e}{c['day_return']:+.1f}% | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
 
@@ -1180,15 +1187,67 @@ def send_telegram_doc(filepath: str, caption: str = "") -> bool:
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PERSISTENCE TRACKER — rolling 7-day history
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_scan_history() -> dict:
+    """Load rolling daily scan history. Returns empty structure if file missing."""
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            if "daily" not in data:
+                return {"daily": {}}
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"daily": {}}
+
+
+def save_scan_history(history: dict, candidates: list) -> None:
+    """Merge today's candidates into history and keep a rolling 7-day window."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    existing = history["daily"].get(today, {})
+    for c in candidates:
+        existing[c["ticker"]] = c.get("tier", "stock")
+    history["daily"][today] = existing
+    # Retain only the 7 most recent dates
+    all_dates = sorted(history["daily"].keys(), reverse=True)
+    history["daily"] = {d: history["daily"][d] for d in all_dates[:7]}
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    logger.info(f"Scan history saved — {len(history['daily'])} day(s) on record")
+
+
+def compute_repeat_days(ticker: str, history: dict) -> int:
+    """Count distinct past days (excluding today) this ticker appeared in scans."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return sum(
+        1 for date, tickers in history["daily"].items()
+        if date != today and ticker in tickers
+    )
+
+
 def main():
     logger.info("=" * 60)
-    logger.info("INTRADAY MOMENTUM SCANNER v4 — Dynamic Universe")
+    logger.info("INTRADAY MOMENTUM SCANNER v5 — Dynamic Universe + ETF/Futures Tiers")
     logger.info(f"Market:  {MARKET_CONTEXT.upper()}")
     logger.info(f"Target:  >{MIN_MOVE_PCT}%")
     logger.info(f"Mode:    {'DRY RUN' if DRY_RUN else 'LIVE'}")
     logger.info("=" * 60)
 
+    # ── Load history and run scan ─────────────────────────────────────────────
+    history    = load_scan_history()
     candidates = run_all_markets()
+
+    # Tag each candidate with how many previous days it appeared
+    for c in candidates:
+        c["repeat_days"] = compute_repeat_days(c["ticker"], history)
+
+    repeaters = [c for c in candidates if c["repeat_days"] >= 2]
+    if repeaters:
+        logger.info(f"Repeat candidates (>=2 days): {[c['ticker'] for c in repeaters]}")
+
+    save_scan_history(history, candidates)
 
     # ── Write scan_results.json for ta_runner.py ──────────────────────────────
     with open(OUTPUT_JSON, "w") as f:

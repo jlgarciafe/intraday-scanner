@@ -69,6 +69,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Download scan history (previous runs)
+        continue-on-error: true
+        run: |
+          ARTIFACT_URL=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=scan-history&per_page=1" \
+            | python3 -c "
+          import sys, json
+          arts = json.load(sys.stdin).get('artifacts', [])
+          print(arts[0]['archive_download_url'] if arts else '')
+          ")
+          if [ -n "$ARTIFACT_URL" ]; then
+            curl -L -s \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "$ARTIFACT_URL" -o scan-history.zip
+            unzip -o scan-history.zip scan_history.json 2>/dev/null || true
+            echo "Scan history loaded"
+          else
+            echo "No previous history found — first run"
+          fi
+
       - name: Detect active market from schedule
         id: market_context
         run: |
@@ -93,7 +114,8 @@ jobs:
           MARKET_CONTEXT:     ${{ steps.market_context.outputs.market }}
           MIN_MOVE_PCT:       ${{ github.event.inputs.min_move_pct || '3.0' }}
           DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
-          OUTPUT_JSON:        "scan_results.json"   # scanner writes this file
+          OUTPUT_JSON:        "scan_results.json"
+          HISTORY_FILE:       "scan_history.json"
         run: |
           python scanner.py
           # Count qualifying tickers from JSON output
@@ -115,6 +137,15 @@ jobs:
             scan_results.json
             *.md
           retention-days: 7
+
+      - name: Upload scan history (rolling 7-day)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-history
+          path: scan_history.json
+          retention-days: 30
+          overwrite: true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JOB 2 — TA ENTRY RUNNER
