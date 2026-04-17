@@ -13,13 +13,14 @@ name: Intraday Market Scanner + TA Entry
 
 on:
   schedule:
+    - cron: "0  0  * * 1-5"   # Asia open  (Tokyo / Seoul / Sydney)
     - cron: "30 1  * * 1-5"   # HK open
-    - cron: "0  0  * * 1-5"   # Tokyo open
+    - cron: "0  4  * * 1-5"   # India open (NSE 09:15 IST = 03:45 UTC)
     - cron: "0  7  * * 1-5"   # EU open
     - cron: "0  8  * * 1-5"   # Madrid / Paris
-    - cron: "30 13 * * 1-5"   # US open
-    - cron: "0  16 * * 1-5"   # US mid
-    - cron: "0  20 * * 1-5"   # US close
+    - cron: "30 13 * * 1-5"   # US + Canada open
+    - cron: "0  16 * * 1-5"   # US + Canada mid
+    - cron: "0  20 * * 1-5"   # US + Canada close
 
   workflow_dispatch:
     inputs:
@@ -96,8 +97,9 @@ jobs:
           HOUR=$(date -u +%H)
           MIN=$(date -u +%M)
           MARKET="all"
-          if [ "$HOUR" = "00" ]; then MARKET="jp"; fi
-          if [ "$HOUR" = "01" ]; then MARKET="hk"; fi
+          if [ "$HOUR" = "00" ]; then MARKET="asia"; fi   # JP / KR / AU open
+          if [ "$HOUR" = "01" ]; then MARKET="hk"; fi     # HK open
+          if [ "$HOUR" = "04" ]; then MARKET="in"; fi     # India open (NSE)
           if [ "$HOUR" = "07" ] || [ "$HOUR" = "08" ]; then MARKET="eu"; fi
           if [ "$HOUR" = "13" ] || [ "$HOUR" = "16" ] || [ "$HOUR" = "20" ]; then MARKET="us"; fi
           # Manual override

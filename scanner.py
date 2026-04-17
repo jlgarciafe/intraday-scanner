@@ -1166,11 +1166,13 @@ def run_all_markets() -> list:
     })
 
     if MARKET_CONTEXT == "all":
-        markets = ["us", "uk", "de", "jp", "es", "hk", "fr", "in", "au", "ca", "kr"]
+        markets = ["us", "ca", "uk", "de", "jp", "es", "hk", "fr", "in", "au", "kr"]
     elif MARKET_CONTEXT == "eu":
         markets = ["uk", "de", "es", "fr"]
     elif MARKET_CONTEXT == "asia":
-        markets = ["jp", "hk", "in", "kr"]
+        markets = ["jp", "hk", "au", "kr"]   # 00:00-06:00 UTC block
+    elif MARKET_CONTEXT == "us":
+        markets = ["us", "ca"]               # TSX opens same time as NYSE
     else:
         markets = [MARKET_CONTEXT] if MARKET_CONTEXT in FEE_MODEL else ["us"]
 
