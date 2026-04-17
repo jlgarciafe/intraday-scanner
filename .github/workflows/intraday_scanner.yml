@@ -1,26 +1,25 @@
 name: Intraday Market Scanner + TA Entry
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schedule (UTC):
-#   01:30  Hong Kong open
-#   00:00  Tokyo open
-#   07:00  Frankfurt / EU open
-#   08:00  London / Madrid / Paris open
-#   13:30  US open
-#   16:00  US mid-session
-#   20:00  US close
+# Schedule (UTC) — ALL markets scanned every run.
+# yfinance returns real-time data if the market is open,
+# latest close / after-hours data if it is closed.
+#   00:00  Asia open    (Tokyo, Seoul, Sydney)
+#   04:00  India open   (NSE 09:15 IST)
+#   08:00  Europe open  (London, Frankfurt, Madrid, Paris)
+#   13:30  Americas open (NYSE, TSX)
+#   17:00  Americas mid-session
+#   21:00  Americas close / global wrap-up
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    - cron: "0  0  * * 1-5"   # Asia open  (Tokyo / Seoul / Sydney)
-    - cron: "30 1  * * 1-5"   # HK open
-    - cron: "0  4  * * 1-5"   # India open (NSE 09:15 IST = 03:45 UTC)
-    - cron: "0  7  * * 1-5"   # EU open
-    - cron: "0  8  * * 1-5"   # Madrid / Paris
-    - cron: "30 13 * * 1-5"   # US + Canada open
-    - cron: "0  16 * * 1-5"   # US + Canada mid
-    - cron: "0  20 * * 1-5"   # US + Canada close
+    - cron: "0  0  * * 1-5"   # Asia open
+    - cron: "0  4  * * 1-5"   # India open
+    - cron: "0  8  * * 1-5"   # Europe open
+    - cron: "30 13 * * 1-5"   # Americas open
+    - cron: "0  17 * * 1-5"   # Americas mid
+    - cron: "0  21 * * 1-5"   # Americas close / wrap-up
 
   workflow_dispatch:
     inputs:
@@ -91,18 +90,12 @@ jobs:
             echo "No previous history found — first run"
           fi
 
-      - name: Detect active market from schedule
+      - name: Set market context
         id: market_context
         run: |
-          HOUR=$(date -u +%H)
-          MIN=$(date -u +%M)
+          # Always scan all markets — yfinance returns latest available data
+          # (real-time if open, last close / after-hours if closed)
           MARKET="all"
-          if [ "$HOUR" = "00" ]; then MARKET="asia"; fi   # JP / KR / AU open
-          if [ "$HOUR" = "01" ]; then MARKET="hk"; fi     # HK open
-          if [ "$HOUR" = "04" ]; then MARKET="in"; fi     # India open (NSE)
-          if [ "$HOUR" = "07" ] || [ "$HOUR" = "08" ]; then MARKET="eu"; fi
-          if [ "$HOUR" = "13" ] || [ "$HOUR" = "16" ] || [ "$HOUR" = "20" ]; then MARKET="us"; fi
-          # Manual override
           INPUT="${{ github.event.inputs.market }}"
           if [ -n "$INPUT" ] && [ "$INPUT" != "all" ]; then MARKET="$INPUT"; fi
           echo "market=$MARKET" >> $GITHUB_OUTPUT
