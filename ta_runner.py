@@ -24,6 +24,7 @@ import os
 import json
 import argparse
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -484,18 +485,20 @@ def main():
     results    = []
     actionable = []
 
-    for ticker in tickers:
-        print(f"  -> {ticker}...", end=" ", flush=True)
-        r = run_ta_entry(ticker, scanner_data.get(ticker, {}))
-        results.append(r)
-
-        if r["status"] == "ok":
-            print(f"OK | {r['verdict'][:50]}")
-            actionable.append(r)
-        elif r["status"] == "pass":
-            print(f"PASS -- {r['pass_reason']}")
-        else:
-            print(f"ERROR -- {r['error']}")
+    print(f"  Running parallel TA analysis (workers=10)...")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        fut_map = {ex.submit(run_ta_entry, t, scanner_data.get(t, {})): t for t in tickers}
+        for fut in as_completed(fut_map):
+            r = fut.result()
+            results.append(r)
+            ticker = r["ticker"]
+            if r["status"] == "ok":
+                print(f"  -> {ticker}: OK | {r['verdict'][:50]}")
+                actionable.append(r)
+            elif r["status"] == "pass":
+                print(f"  -> {ticker}: PASS -- {r['pass_reason']}")
+            else:
+                print(f"  -> {ticker}: ERROR -- {r['error']}")
 
     # Rank by return probability, take top N
     top10 = rank_by_return_probability(actionable, top_n=TOP_N)

@@ -963,12 +963,24 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
         # Bonus: near 52w high = breakout candidate (+10), mid-range (+5), below mid (0)
         range52_bonus = 10 if range_pos >= 0.85 else (5 if range_pos >= 0.50 else 0)
 
+        # ── MA alignment bonus ─────────────────────────────────────────────────
+        # Full bull alignment MA20>MA50>MA200 = +10, partial = +5, none = 0
+        ma20  = float(pd.Series(c).rolling(20).mean().iloc[-1])  if len(c) >= 20  else c[-1]
+        ma50  = float(pd.Series(c).rolling(50).mean().iloc[-1])  if len(c) >= 50  else c[-1]
+        ma200 = float(pd.Series(c).rolling(200).mean().iloc[-1]) if len(c) >= 200 else c[-1]
+        if c[-1] > ma20 > ma50 > ma200:
+            ma_bonus = 10   # full bull alignment
+        elif c[-1] > ma50 and ma50 > ma200:
+            ma_bonus = 5    # price above 50 & 200, partial alignment
+        else:
+            ma_bonus = 0
+
         score = (
             min(atr_pct/5.0, 1.0)*30 +
             min(rvol/3.0, 1.0)*25 +
             min(abs(day_return)/3.0, 1.0)*25 +
             (1.0 if 60<=rsi<=80 else 0.6 if 40<=rsi<60 else 0.4)*20 +
-            range52_bonus
+            range52_bonus + ma_bonus
         )
 
         logger.info(
