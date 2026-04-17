@@ -138,7 +138,7 @@ FUTURES_UNIVERSE = [
     # Bond futures
     "ZN=F", "ZB=F",
     # Commodities
-    "CL=F", "NG=F", "GC=F", "SI=F", "HG=F",
+    "CL=F", "NG=F", "GC=F", "SI=F", "HG=F", "PL=F", "PA=F",
     # Currency / vol
     "6E=F", "6J=F", "VX=F",
     # Crypto futures (CME)
