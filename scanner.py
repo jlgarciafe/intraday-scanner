@@ -230,6 +230,13 @@ def get_ticker_name(ticker: str) -> str:
     return ""
 
 
+# ── Benchmark map (RS vs index, one per market) ───────────────────────────────
+BENCHMARK_MAP = {
+    "us": "SPY",  "uk": "EWU",  "de": "EWG",  "jp": "EWJ",
+    "es": "EWP",  "fr": "EWQ",  "hk": "EWH",
+    "in": "INDA", "au": "EWA",  "ca": "EWC",  "kr": "EWY",
+}
+
 # ── Global run stats ──────────────────────────────────────────────────────────
 _STATS = {
     "universe_total":    0,
@@ -719,6 +726,25 @@ def _kospi_fallback():
     ]
 
 
+# ── Benchmark return helper (Point 2 — RS vs index) ──────────────────────────
+
+def fetch_benchmark_return(market_key: str) -> float:
+    """Return today's day_return % for the benchmark index of a market."""
+    ticker = BENCHMARK_MAP.get(market_key)
+    if not ticker:
+        return 0.0
+    try:
+        raw = yf.download(ticker, period="5d", interval="1d",
+                          auto_adjust=True, progress=False, timeout=15)
+        if raw is None or len(raw) < 2:
+            return 0.0
+        df = flatten_df(raw)
+        c  = df["Close"].astype(float).values
+        return round(((c[-1] - c[-2]) / c[-2] * 100), 2) if c[-2] > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STAGE 2 — VOLUME PRE-SCREEN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -851,12 +877,12 @@ def prescreen_volume(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_snapshot(ticker: str) -> Optional[pd.DataFrame]:
-    """Fetch 30 days daily OHLCV for full analysis."""
-    for period in ["30d", "1mo"]:
+    """Fetch 1 year daily OHLCV for full analysis (enables 52-week range metrics)."""
+    for period in ["1y", "6mo"]:
         try:
             raw = yf.download(
                 ticker, period=period, interval="1d",
-                auto_adjust=True, progress=False, timeout=15,
+                auto_adjust=True, progress=False, timeout=20,
             )
             if raw is None or len(raw) < 5:
                 continue
@@ -930,17 +956,25 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
         day_return = ((c[-1]-c[-2])/c[-2]*100) if len(c)>=2 and c[-2]>0 else 0.0
         day_range  = ((h[-1]-l[-1])/l[-1]*100) if l[-1]>0 else 0.0
 
+        # ── 52-week range position (Point 5) ──────────────────────────────────
+        w52_h     = float(h[-252:].max()) if len(h) >= 252 else float(h.max())
+        w52_l     = float(l[-252:].min()) if len(l) >= 252 else float(l.min())
+        range_pos = round((c[-1] - w52_l) / (w52_h - w52_l), 2) if w52_h > w52_l else 0.5
+        # Bonus: near 52w high = breakout candidate (+10), mid-range (+5), below mid (0)
+        range52_bonus = 10 if range_pos >= 0.85 else (5 if range_pos >= 0.50 else 0)
+
         score = (
             min(atr_pct/5.0, 1.0)*30 +
             min(rvol/3.0, 1.0)*25 +
             min(abs(day_return)/3.0, 1.0)*25 +
-            (1.0 if 60<=rsi<=80 else 0.6 if 40<=rsi<60 else 0.4)*20
+            (1.0 if 60<=rsi<=80 else 0.6 if 40<=rsi<60 else 0.4)*20 +
+            range52_bonus
         )
 
         logger.info(
             f"    {ticker}: price={c[-1]:.2f} | ATR={atr_pct:.2f}% | "
             f"RVOL={rvol:.2f}x | RSI={rsi:.0f} | day={day_return:+.2f}% | "
-            f"range={day_range:.2f}% | vol={int(v[-1]):,} | score={score:.0f}"
+            f"range={day_range:.2f}% | 52w={range_pos:.0%} | vol={int(v[-1]):,} | score={score:.0f}"
         )
 
         return {
@@ -949,6 +983,8 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
             "rsi": round(rsi,1), "day_return": round(day_return,2),
             "day_range": round(day_range,2), "volume": int(v[-1]),
             "score": round(score,1),
+            "week52_high": round(w52_h,4), "week52_low": round(w52_l,4),
+            "range_pos": range_pos,
         }
     except Exception as e:
         logger.info(f"    {ticker}: analysis error — {e}")
@@ -1056,9 +1092,10 @@ def scan_tier(tier_name: str, universe: list) -> list:
             logger.info(f"    {ticker}: CANDIDATE")
             candidates.append({
                 **m,
-                "tier":      tier_name,
-                "market":    "GLOBAL",
-                "net_yield": net_yield(m["atr_pct"], market="us", tier=tier_name),
+                "tier":        tier_name,
+                "market":      "GLOBAL",
+                "net_yield":   net_yield(m["atr_pct"], market="us", tier=tier_name),
+                "rs_vs_bench": 0.0,
             })
 
     _STATS["universe_total"] += len(universe)
@@ -1108,6 +1145,11 @@ def scan_market(market_key: str) -> list:
 
     logger.info(f"\n  Full analysis on {len(prescreened)} pre-screened stocks (parallel, workers={MAX_WORKERS_ANALYSIS}):")
 
+    # Fetch benchmark return once for relative-strength calculation (Point 2)
+    bench_return = fetch_benchmark_return(market_key)
+    if bench_return != 0.0:
+        logger.info(f"  Benchmark ({BENCHMARK_MAP.get(market_key,'?')}): {bench_return:+.2f}%")
+
     # Stage 3: Full analysis — parallel
     candidates, data_fail, filtered = [], 0, 0
 
@@ -1126,9 +1168,10 @@ def scan_market(market_key: str) -> list:
             logger.info(f"    {ticker}: CANDIDATE")
             candidates.append({
                 **m,
-                "tier":      "stock",
-                "market":    market_key.upper(),
-                "net_yield": net_yield(m["atr_pct"], market_key, tier="stock"),
+                "tier":        "stock",
+                "market":      market_key.upper(),
+                "net_yield":   net_yield(m["atr_pct"], market_key, tier="stock"),
+                "rs_vs_bench": round(m["day_return"] - bench_return, 2),
             })
 
     # Accumulate stats
@@ -1306,15 +1349,19 @@ def format_telegram(candidates: list) -> str:
         )
 
     def fmt(c: dict, i: int) -> str:
-        e     = "🟢" if c["day_return"] > 0 else "🔴"
-        label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
-        rpt   = c.get("repeat_days", 0)
-        trend = c.get("score_trend", "")
-        flag  = f" 🔁{rpt}d{trend}" if rpt >= 3 else ""
-        name  = get_ticker_name(c["ticker"])
+        e        = "🟢" if c["day_return"] > 0 else "🔴"
+        label    = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
+        rpt      = c.get("repeat_days", 0)
+        trend    = c.get("score_trend", "")
+        flag     = f" 🔁{rpt}d{trend}" if rpt >= 3 else ""
+        earn     = " ⚠️EARN" if c.get("earnings_soon") else ""
+        name     = get_ticker_name(c["ticker"])
         name_str = f" <i>({name})</i>" if name else ""
+        rs       = c.get("rs_vs_bench")
+        rs_str   = f" RS{rs:+.1f}%" if rs is not None and c.get("tier") == "stock" else ""
         return (
-            f"{i}. [{label}] <b>{c['ticker']}</b>{name_str}{flag} {e}{c['day_return']:+.1f}% | "
+            f"{i}. [{label}] <b>{c['ticker']}</b>{name_str}{flag}{earn} "
+            f"{e}{c['day_return']:+.1f}%{rs_str} | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
 
@@ -1457,6 +1504,72 @@ def compute_persistence(ticker: str, history: dict) -> dict:
     return {"days": days, "trend": trend}
 
 
+# ── Point 3 + 4 — earnings flag and sector deduplication ─────────────────────
+
+def enrich_candidates(candidates: list) -> None:
+    """
+    Parallel yfinance enrichment for stock candidates only.
+    Adds two fields in-place:
+      earnings_soon (bool)  — earnings within 5 days
+      sector        (str)   — yfinance sector/industry string
+    """
+    stock_cands = [c for c in candidates if c.get("tier") == "stock"]
+    if not stock_cands:
+        return
+
+    def _fetch(c):
+        try:
+            info = yf.Ticker(c["ticker"]).info
+            # Earnings flag
+            ed = info.get("earningsDate") or info.get("earningsTimestamp")
+            if ed:
+                if isinstance(ed, (int, float)):
+                    from datetime import date
+                    ed_date = datetime.fromtimestamp(ed).date()
+                else:
+                    ed_date = datetime.strptime(str(ed)[:10], "%Y-%m-%d").date()
+                days_to = (ed_date - datetime.now(timezone.utc).date()).days
+                c["earnings_soon"] = 0 <= days_to <= 5
+            else:
+                c["earnings_soon"] = False
+            # Sector
+            c["sector"] = info.get("sector") or info.get("industry") or "Other"
+        except Exception:
+            c["earnings_soon"] = False
+            c["sector"]        = "Other"
+
+    logger.info(f"  Enriching {len(stock_cands)} stock candidates (earnings + sector)...")
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(_fetch, c) for c in stock_cands]
+        for f in as_completed(futs):
+            f.result()
+
+    # ETF/Futures don't have traditional earnings — set defaults
+    for c in candidates:
+        if c.get("tier") != "stock":
+            c.setdefault("earnings_soon", False)
+            c.setdefault("sector", c.get("tier", "other").upper())
+
+
+def deduplicate_by_sector(candidates: list, max_per_sector: int = 2) -> list:
+    """
+    For stock candidates: keep top max_per_sector per sector per market.
+    ETF and Futures candidates are always kept (already capped in scan_tier).
+    Candidates must be pre-sorted by score descending.
+    """
+    counts  = {}
+    result  = []
+    for c in sorted(candidates, key=lambda x: x["score"], reverse=True):
+        if c.get("tier") in ("etf", "future"):
+            result.append(c)
+            continue
+        key = f"{c.get('market','?')}:{c.get('sector','Other')}"
+        if counts.get(key, 0) < max_per_sector:
+            counts[key] = counts.get(key, 0) + 1
+            result.append(c)
+    return sorted(result, key=lambda x: x["score"], reverse=True)
+
+
 def main():
     logger.info("=" * 60)
     logger.info("INTRADAY MOMENTUM SCANNER v6 — Dynamic Universe + ETF/Futures Tiers + 11 Markets")
@@ -1468,6 +1581,12 @@ def main():
     # ── Load history and run scan ─────────────────────────────────────────────
     history    = load_scan_history()
     candidates = run_all_markets()
+
+    # ── Enrich with earnings flag + sector (Points 3 & 4) ────────────────────
+    enrich_candidates(candidates)
+    before = len(candidates)
+    candidates = deduplicate_by_sector(candidates, max_per_sector=2)
+    logger.info(f"Sector dedup: {before} → {len(candidates)} candidates")
 
     # Tag each candidate with persistence data (days + score trend)
     for c in candidates:
