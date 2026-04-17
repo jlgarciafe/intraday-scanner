@@ -1,17 +1,23 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
-  INTRADAY MOMENTUM SCANNER v4 — Dynamic Universe
+  INTRADAY MOMENTUM SCANNER v5 — Dynamic Universe + ETF/Futures Tiers
 
   Architecture:
     Stage 1 — Fetch full index constituents dynamically (Wikipedia/free APIs)
+              ETF and Futures universes are hardcoded (stable, small sets)
     Stage 2 — Lightweight volume pre-screen across all constituents
-              Passes if RVOL >= 1.2x OR ATR >= 2.5% (plus volume floor)
+              Per-tier thresholds: ETF RVOL≥1.2/ATR≥0.8%, Future RVOL≥1.1/ATR≥0.5%,
+              Stock RVOL≥1.2/ATR≥2.5% (plus volume floor)
     Stage 3 — Full ATR + momentum analysis on pre-screened candidates
-    Stage 4 — Filter, rank, alert
+    Stage 4 — Filter (tier-aware), rank, alert
 
-  Markets covered:
+  Tiers in scan_results.json:
+    etf     — ~30 global index + sector ETFs (SPY, QQQ, IWM, XLF, SMH, …)
+    future  — ~15 index/commodity futures (ES=F, NQ=F, CL=F, GC=F, …)
+    stock   — per-market index constituents (unchanged from v4)
+
+  Markets covered (stock tier):
     US  — S&P 500 (~503) + NASDAQ supplement (~162) + Russell 2000 curated (~192)
-          Total ~857 stocks
     UK  — FTSE 100 (100 stocks) via Wikipedia
     DE  — DAX 40 (40 stocks) via Wikipedia
     JP  — Nikkei 225 (225 stocks) via Wikipedia
@@ -57,11 +63,11 @@ MIN_MOVE_PCT       = float(os.getenv("MIN_MOVE_PCT", "5.0"))
 DRY_RUN            = os.getenv("DRY_RUN", "false").lower() == "true"
 OUTPUT_JSON        = os.getenv("OUTPUT_JSON", "scan_results.json")
 
-# ── Pre-screen thresholds ─────────────────────────────────────────────────────
+# ── Pre-screen thresholds (stock tier defaults) ───────────────────────────────
 PRESCREEN_RVOL     = 1.2    # Minimum RVOL to pass pre-screen (lowered from 1.5)
 PRESCREEN_ATR      = 2.5    # ATR% floor — pass if ATR >= this even when RVOL < 1.2x
                             # Gate logic: vol >= min AND (RVOL >= 1.2x OR ATR >= 2.5%)
-PRESCREEN_MIN_VOL  = {      # Minimum absolute volume per market
+PRESCREEN_MIN_VOL  = {      # Minimum absolute volume per market (stock tier)
     "us": 500_000,
     "uk": 100_000,
     "de": 50_000,
@@ -72,15 +78,83 @@ PRESCREEN_MIN_VOL  = {      # Minimum absolute volume per market
 }
 MAX_PRESCREEN_PASS = 60     # Max stocks to run full analysis on per market
 
+# ── Tier configuration ────────────────────────────────────────────────────────
+# Each tier has its own pre-screen and filter thresholds.
+# Stock tier re-uses the globals above for 100% backward compatibility.
+TIER_CONFIG = {
+    "etf": {
+        "prescreen_rvol": 1.2,
+        "prescreen_atr":  0.8,
+        "filter_rvol":    1.2,
+        "filter_atr":     0.8,
+        "filter_score":   20,
+        "min_vol":        500_000,
+        "max_pass":       30,
+        "fee_key":        "us",
+        "skip_vol_floor": False,
+    },
+    "future": {
+        "prescreen_rvol": 1.1,
+        "prescreen_atr":  0.5,
+        "filter_rvol":    1.1,
+        "filter_atr":     0.5,
+        "filter_score":   15,
+        "min_vol":        500,      # contracts, not shares
+        "max_pass":       15,
+        "fee_key":        "futures",
+        "skip_vol_floor": True,     # don't reject futures on share-volume floors
+    },
+    "stock": {
+        "prescreen_rvol": PRESCREEN_RVOL,
+        "prescreen_atr":  PRESCREEN_ATR,
+        "filter_rvol":    1.3,
+        "filter_atr":     PRESCREEN_ATR,
+        "filter_score":   35,
+        "min_vol":        None,     # resolved per-market via PRESCREEN_MIN_VOL
+        "max_pass":       MAX_PRESCREEN_PASS,
+        "fee_key":        None,     # resolved per-market via FEE_MODEL
+        "skip_vol_floor": False,
+    },
+}
+
+# ── Hardcoded ETF universe ────────────────────────────────────────────────────
+ETF_UNIVERSE = [
+    # Broad US index
+    "SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "MDY",
+    # International index
+    "EFA", "EWG", "EWU", "EWQ", "EWP", "EWJ", "EWH", "FXI", "EEM",
+    # US sector
+    "XLF", "XLE", "XLK", "XLV", "XLI", "XLU", "XLP", "XLB", "XLRE", "XLC",
+    # Tech / semis
+    "SMH", "SOXX", "ARKK",
+    # Volatility / inverse
+    "UVXY", "SQQQ", "SPXS",
+]
+
+# ── Hardcoded Futures universe ────────────────────────────────────────────────
+FUTURES_UNIVERSE = [
+    # Equity index futures
+    "ES=F", "NQ=F", "RTY=F", "YM=F",
+    # Bond futures
+    "ZN=F", "ZB=F",
+    # Commodities
+    "CL=F", "NG=F", "GC=F", "SI=F", "HG=F",
+    # Currency / vol
+    "6E=F", "6J=F", "VX=F",
+    # Crypto futures (CME)
+    "BTC=F",
+]
+
 # ── Fee model ─────────────────────────────────────────────────────────────────
 FEE_MODEL = {
-    "us": {"commission_pct": 0.005, "spread_pct": 0.05,  "slippage_pct": 0.05},
-    "uk": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
-    "de": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
-    "jp": {"commission_pct": 0.050, "spread_pct": 0.08,  "slippage_pct": 0.08},
-    "es": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
-    "hk": {"commission_pct": 0.080, "spread_pct": 0.10,  "slippage_pct": 0.10},
-    "fr": {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "us":      {"commission_pct": 0.005, "spread_pct": 0.05,  "slippage_pct": 0.05},
+    "uk":      {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "de":      {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "jp":      {"commission_pct": 0.050, "spread_pct": 0.08,  "slippage_pct": 0.08},
+    "es":      {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "hk":      {"commission_pct": 0.080, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "fr":      {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "futures": {"commission_pct": 0.002, "spread_pct": 0.01,  "slippage_pct": 0.02},
 }
 
 # ── Global run stats ──────────────────────────────────────────────────────────
@@ -468,17 +542,29 @@ def flatten_df(raw: pd.DataFrame) -> pd.DataFrame:
     return raw.loc[:, ~raw.columns.duplicated()]
 
 
-def prescreen_volume(tickers: list, market_key: str) -> list:
+def prescreen_volume(
+    tickers: list,
+    market_key: str,
+    rvol_threshold: float = None,
+    atr_threshold: float = None,
+    min_vol_override: int = None,
+    max_pass: int = None,
+) -> list:
     """
     Lightweight volume pre-screen across all index constituents.
     Downloads 5 days of data per ticker individually (batch MultiIndex is unreliable).
-    Returns tickers sorted by RVOL descending, capped at MAX_PRESCREEN_PASS.
-    RVOL > PRESCREEN_RVOL = elevated interest = worth full analysis.
+    Returns tickers sorted by RVOL descending, capped at max_pass.
+
+    Optional overrides allow tier-specific thresholds (ETF/Futures) without
+    changing the stock-tier defaults.
     """
-    min_vol  = PRESCREEN_MIN_VOL.get(market_key, 50_000)
+    rvol_thr = rvol_threshold if rvol_threshold is not None else PRESCREEN_RVOL
+    atr_thr  = atr_threshold  if atr_threshold  is not None else PRESCREEN_ATR
+    min_vol  = min_vol_override if min_vol_override is not None else PRESCREEN_MIN_VOL.get(market_key, 50_000)
+    cap      = max_pass if max_pass is not None else MAX_PRESCREEN_PASS
     screened = []
 
-    logger.info(f"  Pre-screening {len(tickers)} tickers for RVOL≥{PRESCREEN_RVOL}x...")
+    logger.info(f"  Pre-screening {len(tickers)} tickers for RVOL>={rvol_thr}x / ATR>={atr_thr}%...")
 
     errors = 0
     for i, ticker in enumerate(tickers):
@@ -517,8 +603,8 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
                     atr_pct = (sum(trs) / len(trs)) / c[-1] * 100
 
             # Gate: volume floor always required, then RVOL OR ATR
-            passes_rvol = rvol >= PRESCREEN_RVOL
-            passes_atr  = atr_pct >= PRESCREEN_ATR
+            passes_rvol = rvol >= rvol_thr
+            passes_atr  = atr_pct >= atr_thr
             if today_vol >= min_vol and (passes_rvol or passes_atr):
                 screened.append({
                     "ticker":    ticker,
@@ -547,15 +633,15 @@ def prescreen_volume(tickers: list, market_key: str) -> list:
         by_atr  = sum(1 for s in screened if s["passed_by"] == "ATR")
         logger.info(
             f"  Pre-screen: {len(screened)} passed from {len(tickers)} "
-            f"(RVOL≥{PRESCREEN_RVOL}x: {by_rvol} | ATR≥{PRESCREEN_ATR}%: {by_atr}) "
+            f"(RVOL>={rvol_thr}x: {by_rvol} | ATR>={atr_thr}%: {by_atr}) "
             f"| Top: {screened[0]['ticker']} RVOL={screened[0]['rvol']}x ATR={screened[0]['atr_pct']}%"
         )
     else:
         logger.info(f"  Pre-screen: 0 passed from {len(tickers)} — market may be closed or inactive")
 
-    if len(screened) > MAX_PRESCREEN_PASS:
-        logger.info(f"  Capping at top {MAX_PRESCREEN_PASS} by RVOL for full analysis")
-        screened = screened[:MAX_PRESCREEN_PASS]
+    if len(screened) > cap:
+        logger.info(f"  Capping at top {cap} by RVOL for full analysis")
+        screened = screened[:cap]
 
     return [s["ticker"] for s in screened]
 
@@ -661,46 +747,139 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
         return {}
 
 
-def passes_filters(m: dict, market: str) -> tuple:
+def passes_filters(m: dict, market: str, tier: str = "stock") -> tuple:
     """
-    Volume floor always required.
-    Momentum gate: RVOL >= 1.3x OR ATR >= PRESCREEN_ATR (same OR logic as pre-screen).
-    ATR/score gates only applied when MIN_MOVE_PCT > 0.
+    Tier-aware filter gate.
+
+    - ETF/Future tiers use TIER_CONFIG thresholds and skip stock-style
+      min-price / share-volume floors where appropriate.
+    - Stock tier retains existing behaviour (100% backward compatible).
+    - ATR/score gates for all tiers are only tightened when MIN_MOVE_PCT > 0.
     """
     vol   = m.get("volume", 0)
     rvol  = m.get("rvol", 0)
     atr   = m.get("atr_pct", 0)
     score = m.get("score", 0)
 
-    min_vol = PRESCREEN_MIN_VOL.get(market, 50_000)
-    if vol < min_vol:
-        return False, f"vol {vol:,} < {min_vol:,}"
+    tc = TIER_CONFIG.get(tier, TIER_CONFIG["stock"])
 
-    # Momentum gate: RVOL OR ATR — consistent with pre-screen logic
-    if rvol < 1.3 and atr < PRESCREEN_ATR:
-        return False, f"RVOL {rvol:.2f}x < 1.3x and ATR {atr:.2f}% < {PRESCREEN_ATR}%"
+    # Volume floor (skipped for futures — contract volume is tiny by design)
+    if not tc["skip_vol_floor"]:
+        min_vol = tc["min_vol"] if tc["min_vol"] is not None else PRESCREEN_MIN_VOL.get(market, 50_000)
+        if vol < min_vol:
+            return False, f"vol {vol:,} < {min_vol:,}"
 
+    # Momentum gate: RVOL OR ATR
+    filter_rvol = tc["filter_rvol"]
+    filter_atr  = tc["filter_atr"]
+    if rvol < filter_rvol and atr < filter_atr:
+        return False, f"RVOL {rvol:.2f}x < {filter_rvol}x and ATR {atr:.2f}% < {filter_atr}%"
+
+    min_score = tc["filter_score"]
     if MIN_MOVE_PCT > 0:
         if atr < MIN_MOVE_PCT * 0.7:
             return False, f"ATR {atr:.2f}% < {MIN_MOVE_PCT*0.7:.2f}%"
-        if score < 35:
-            return False, f"score {score:.0f} < 35"
+        if score < min_score:
+            return False, f"score {score:.0f} < {min_score}"
     else:
-        if score < 20:
-            return False, f"score {score:.0f} < 20"
+        floor = max(min_score - 15, 10)
+        if score < floor:
+            return False, f"score {score:.0f} < {floor}"
 
     return True, "passed"
 
 
-def net_yield(atr_pct: float, market: str) -> float:
-    f = FEE_MODEL.get(market, FEE_MODEL["us"])
-    cost = (f["commission_pct"] + f["spread_pct"] + f["slippage_pct"]) * 2
+def net_yield(atr_pct: float, market: str, tier: str = "stock") -> float:
+    tc      = TIER_CONFIG.get(tier, TIER_CONFIG["stock"])
+    fee_key = tc["fee_key"] if tc["fee_key"] is not None else market
+    f       = FEE_MODEL.get(fee_key, FEE_MODEL["us"])
+    cost    = (f["commission_pct"] + f["spread_pct"] + f["slippage_pct"]) * 2
     return round(atr_pct - cost, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STAGE 4 — ORCHESTRATION
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def scan_tier(tier_name: str, universe: list) -> list:
+    """
+    Run the full pipeline for a hardcoded-universe tier (etf or future).
+    Uses tier-specific pre-screen thresholds and filter gates.
+    Tags every candidate with {"tier": tier_name, "market": "GLOBAL"}.
+    """
+    tc = TIER_CONFIG[tier_name]
+    logger.info(f"\n{'='*60}")
+    logger.info(f"TIER: {tier_name.upper()} | {len(universe)} instruments | Target: >{MIN_MOVE_PCT}%")
+    logger.info(f"{'='*60}")
+
+    prescreened = prescreen_volume(
+        universe,
+        market_key="us",
+        rvol_threshold=tc["prescreen_rvol"],
+        atr_threshold=tc["prescreen_atr"],
+        min_vol_override=tc["min_vol"],
+        max_pass=tc["max_pass"],
+    )
+    if not prescreened:
+        logger.info(f"  {tier_name.upper()}: no instruments passed pre-screen")
+        _STATS["by_market"][tier_name.upper()] = {
+            "universe": len(universe), "prescreen_pass": 0,
+            "data_fail": 0, "filtered": 0, "candidates": 0,
+        }
+        _STATS["universe_total"] += len(universe)
+        return []
+
+    logger.info(f"\n  Full analysis on {len(prescreened)} pre-screened {tier_name}s:")
+    candidates, data_fail, filtered = [], 0, 0
+
+    for i, ticker in enumerate(prescreened, 1):
+        logger.info(f"  [{i}/{len(prescreened)}] {ticker}")
+        df = fetch_snapshot(ticker)
+        if df is None:
+            data_fail += 1
+            continue
+
+        m = analyse_ticker(ticker, df)
+        if not m:
+            data_fail += 1
+            continue
+
+        passed, reason = passes_filters(m, market="us", tier=tier_name)
+        if not passed:
+            logger.info(f"    {ticker}: ❌ {reason}")
+            filtered += 1
+            continue
+
+        logger.info(f"    {ticker}: ✅ CANDIDATE")
+        candidates.append({
+            **m,
+            "tier":      tier_name,
+            "market":    "GLOBAL",
+            "net_yield": net_yield(m["atr_pct"], market="us", tier=tier_name),
+        })
+        time.sleep(0.2)
+
+    _STATS["universe_total"] += len(universe)
+    _STATS["prescreen_pass"] += len(prescreened)
+    _STATS["data_fail"]      += data_fail
+    _STATS["filtered"]       += filtered
+    _STATS["candidates"]     += len(candidates)
+    _STATS["by_market"][tier_name.upper()] = {
+        "universe":       len(universe),
+        "prescreen_pass": len(prescreened),
+        "data_fail":      data_fail,
+        "filtered":       filtered,
+        "candidates":     len(candidates),
+    }
+
+    logger.info(
+        f"\n  {tier_name.upper()}: universe={len(universe)} | "
+        f"prescreen={len(prescreened)} | data_fail={data_fail} | "
+        f"filtered={filtered} | candidates={len(candidates)}"
+    )
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates
+
 
 def scan_market(market_key: str) -> list:
     logger.info(f"\n{'='*60}")
@@ -742,7 +921,7 @@ def scan_market(market_key: str) -> list:
             data_fail += 1
             continue
 
-        passed, reason = passes_filters(m, market_key)
+        passed, reason = passes_filters(m, market_key, tier="stock")
         if not passed:
             logger.info(f"    {ticker}: ❌ {reason}")
             filtered += 1
@@ -751,8 +930,9 @@ def scan_market(market_key: str) -> list:
         logger.info(f"    {ticker}: ✅ CANDIDATE")
         candidates.append({
             **m,
+            "tier":      "stock",
             "market":    market_key.upper(),
-            "net_yield": net_yield(m["atr_pct"], market_key),
+            "net_yield": net_yield(m["atr_pct"], market_key, tier="stock"),
         })
         time.sleep(0.2)
 
@@ -800,8 +980,15 @@ def run_all_markets() -> list:
         markets = [MARKET_CONTEXT] if MARKET_CONTEXT in FEE_MODEL else ["us"]
 
     all_c = []
+
+    # ETF and Futures tiers always run (global, not market-gated)
+    all_c.extend(scan_tier("etf",    ETF_UNIVERSE))
+    all_c.extend(scan_tier("future", FUTURES_UNIVERSE))
+
+    # Stock tier per market
     for m in markets:
         all_c.extend(scan_market(m))
+
     all_c.sort(key=lambda x: x["score"], reverse=True)
 
     # Global summary
@@ -839,7 +1026,7 @@ def format_markdown(candidates: list) -> str:
         return (
             f"## 📊 Intraday Scanner — {now}\n\n"
             f"**Market:** {MARKET_CONTEXT.upper()}  |  **Target:** >{MIN_MOVE_PCT}%\n\n"
-            f"**Universe scanned:** {_STATS['universe_total']:,} stocks  |  "
+            f"**Universe scanned:** {_STATS['universe_total']:,} instruments  |  "
             f"**Pre-screened:** {_STATS['prescreen_pass']}  |  **Candidates:** 0\n\n"
             "**No candidates met the filter criteria.**\n\n"
             "> ⚠️ Research only. Not financial advice.\n"
@@ -848,20 +1035,22 @@ def format_markdown(candidates: list) -> str:
     lines = [
         f"## 📊 Intraday Scanner — {now}",
         f"**Market:** {MARKET_CONTEXT.upper()}  |  **Target:** >{MIN_MOVE_PCT}%  |  **Candidates:** {len(candidates)}",
-        f"**Universe:** {_STATS['universe_total']:,} stocks scanned  |  "
+        f"**Universe:** {_STATS['universe_total']:,} instruments scanned  |  "
         f"**Pre-screen pass:** {_STATS['prescreen_pass']}  |  "
         f"**Final candidates:** {_STATS['candidates']}",
         "",
         "> ⚠️ Research only. Not financial advice. Past ATR ≠ future moves.",
         "",
-        "| # | Ticker | Mkt | Price | Day% | Range% | ATR% | RVOL | RSI | Score | Net |",
-        "|---|--------|-----|-------|------|--------|------|------|-----|-------|-----|",
+        "| # | Tier | Ticker | Mkt | Price | Day% | Range% | ATR% | RVOL | RSI | Score | Net |",
+        "|---|------|--------|-----|-------|------|--------|------|------|-----|-------|-----|",
     ]
     for i, c in enumerate(candidates[:30], 1):
-        e = "🟢" if c["day_return"] > 0 else "🔴"
-        n = "✅" if c["net_yield"] > 0 else "❌"
+        e    = "🟢" if c["day_return"] > 0 else "🔴"
+        n    = "✅" if c["net_yield"] > 0 else "❌"
+        tier = c.get("tier", "stock")
+        tier_label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(tier, tier.upper())
         lines.append(
-            f"| {i} | **{c['ticker']}** | {c['market']} | {c['price']:.2f} | "
+            f"| {i} | {tier_label} | **{c['ticker']}** | {c['market']} | {c['price']:.2f} | "
             f"{e}{c['day_return']:+.1f}% | {c['day_range']:.1f}% | {c['atr_pct']:.1f}% | "
             f"{c['rvol']:.1f}x | {c['rsi']:.0f} | **{c['score']:.0f}** | {n}{c['net_yield']:+.1f}% |"
         )
@@ -901,9 +1090,11 @@ def format_telegram(candidates: list) -> str:
         "",
     ]
     for i, c in enumerate(candidates[:10], 1):
-        e = "🟢" if c["day_return"] > 0 else "🔴"
+        e    = "🟢" if c["day_return"] > 0 else "🔴"
+        tier = c.get("tier", "stock")
+        tier_label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(tier, tier.upper())
         lines.append(
-            f"{i}. <b>{c['ticker']}</b> {e}{c['day_return']:+.1f}% | "
+            f"{i}. [{tier_label}] <b>{c['ticker']}</b> {e}{c['day_return']:+.1f}% | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
     lines += ["", "⚠️ Research only. Not financial advice."]
