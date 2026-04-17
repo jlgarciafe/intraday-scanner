@@ -1082,6 +1082,11 @@ def format_markdown(candidates: list) -> str:
     return "\n".join(lines)
 
 
+def _is_speculative(c: dict) -> bool:
+    """Quality: RSI 40-70, ATR<=8%, RVOL<=10x. Outside those bounds = speculative."""
+    return c.get("rsi", 50) > 70 or c.get("rsi", 50) < 30 or c.get("atr_pct", 0) > 8 or c.get("rvol", 1) > 10
+
+
 def format_telegram(candidates: list) -> str:
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
     lines = [
@@ -1090,14 +1095,49 @@ def format_telegram(candidates: list) -> str:
         f"Universe: {_STATS['universe_total']:,} | Found: {len(candidates)}",
         "",
     ]
-    for i, c in enumerate(candidates[:10], 1):
-        e    = "🟢" if c["day_return"] > 0 else "🔴"
-        tier = c.get("tier", "stock")
-        tier_label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(tier, tier.upper())
-        lines.append(
-            f"{i}. [{tier_label}] <b>{c['ticker']}</b> {e}{c['day_return']:+.1f}% | "
+
+    etfs        = sorted([c for c in candidates if c.get("tier") == "etf"],    key=lambda x: x["score"], reverse=True)
+    futures     = sorted([c for c in candidates if c.get("tier") == "future"], key=lambda x: x["score"], reverse=True)
+    stocks      = [c for c in candidates if c.get("tier", "stock") == "stock"]
+    quality     = sorted([c for c in stocks if not _is_speculative(c)], key=lambda x: x["score"], reverse=True)
+    speculative = sorted([c for c in stocks if     _is_speculative(c)], key=lambda x: x["score"], reverse=True)
+
+    def fmt(c: dict, i: int) -> str:
+        e = "🟢" if c["day_return"] > 0 else "🔴"
+        label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
+        return (
+            f"{i}. [{label}] <b>{c['ticker']}</b> {e}{c['day_return']:+.1f}% | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
+
+    n = 1
+    lines.append("🏦 <b>TOP ETFs</b>")
+    for c in etfs[:2]:
+        lines.append(fmt(c, n)); n += 1
+    if not etfs:
+        lines.append("  — none today")
+
+    lines.append("")
+    lines.append("📈 <b>TOP FUTURES</b>")
+    for c in futures[:2]:
+        lines.append(fmt(c, n)); n += 1
+    if not futures:
+        lines.append("  — none today")
+
+    lines.append("")
+    lines.append("📊 <b>TOP STOCKS — Quality</b>")
+    for c in quality[:3]:
+        lines.append(fmt(c, n)); n += 1
+    if not quality:
+        lines.append("  — none today")
+
+    lines.append("")
+    lines.append("⚡ <b>TOP STOCKS — Speculative</b>")
+    for c in speculative[:3]:
+        lines.append(fmt(c, n)); n += 1
+    if not speculative:
+        lines.append("  — none today")
+
     lines += ["", "⚠️ Research only. Not financial advice."]
     return "\n".join(lines)
 
