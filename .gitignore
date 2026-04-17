@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Scanner runtime outputs
+scan_results.json
+scan_*.md
+
+# Environment
+.env
+*.env
