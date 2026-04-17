@@ -776,7 +776,8 @@ def passes_filters(m: dict, market: str, tier: str = "stock") -> tuple:
         return False, f"RVOL {rvol:.2f}x < {filter_rvol}x and ATR {atr:.2f}% < {filter_atr}%"
 
     min_score = tc["filter_score"]
-    if MIN_MOVE_PCT > 0:
+    if MIN_MOVE_PCT > 0 and tier == "stock":
+        # MIN_MOVE_PCT ATR gate applies to stocks only — ETF/Future use TIER_CONFIG thresholds
         if atr < MIN_MOVE_PCT * 0.7:
             return False, f"ATR {atr:.2f}% < {MIN_MOVE_PCT*0.7:.2f}%"
         if score < min_score:
