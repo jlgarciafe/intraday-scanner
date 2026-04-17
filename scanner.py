@@ -969,11 +969,11 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
         ma50  = float(pd.Series(c).rolling(50).mean().iloc[-1])  if len(c) >= 50  else c[-1]
         ma200 = float(pd.Series(c).rolling(200).mean().iloc[-1]) if len(c) >= 200 else c[-1]
         if c[-1] > ma20 > ma50 > ma200:
-            ma_bonus = 10   # full bull alignment
+            ma_bonus = 10; ma_align = "MA↑"
         elif c[-1] > ma50 and ma50 > ma200:
-            ma_bonus = 5    # price above 50 & 200, partial alignment
+            ma_bonus = 5;  ma_align = "MA→"
         else:
-            ma_bonus = 0
+            ma_bonus = 0;  ma_align = "MA↓"
 
         score = (
             min(atr_pct/5.0, 1.0)*30 +
@@ -996,7 +996,7 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
             "day_range": round(day_range,2), "volume": int(v[-1]),
             "score": round(score,1),
             "week52_high": round(w52_h,4), "week52_low": round(w52_l,4),
-            "range_pos": range_pos,
+            "range_pos": range_pos, "ma_align": ma_align,
         }
     except Exception as e:
         logger.info(f"    {ticker}: analysis error — {e}")
@@ -1371,9 +1371,11 @@ def format_telegram(candidates: list) -> str:
         name_str = f" <i>({name})</i>" if name else ""
         rs       = c.get("rs_vs_bench")
         rs_str   = f" RS{rs:+.1f}%" if rs is not None and c.get("tier") == "stock" else ""
+        ma       = c.get("ma_align", "")
+        ma_str   = f" {ma}" if ma else ""
         return (
             f"{i}. [{label}] <b>{c['ticker']}</b>{name_str}{flag}{earn} "
-            f"{e}{c['day_return']:+.1f}%{rs_str} | "
+            f"{e}{c['day_return']:+.1f}%{rs_str}{ma_str} | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
 
