@@ -85,9 +85,15 @@ jobs:
               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               "$ARTIFACT_URL" -o scan-history.zip
             unzip -o scan-history.zip scan_history.json 2>/dev/null || true
-            echo "Scan history loaded"
+            if [ -f scan_history.json ]; then
+              DAYS=$(python3 -c "import json; d=json.load(open('scan_history.json')); print(len(d.get('daily',{})))")
+              echo "Scan history loaded — ${DAYS} day(s) on record"
+              python3 -c "import json; d=json.load(open('scan_history.json')); [print(f'  {date}: {len(tickers)} tickers') for date,tickers in sorted(d.get('daily',{}).items())]"
+            else
+              echo "Scan history: download succeeded but json missing"
+            fi
           else
-            echo "No previous history found — first run"
+            echo "No previous history found — starting fresh"
           fi
 
       - name: Set market context

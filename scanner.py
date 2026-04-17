@@ -1300,7 +1300,7 @@ def format_telegram(candidates: list) -> str:
         e     = "🟢" if c["day_return"] > 0 else "🔴"
         label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
         rpt   = c.get("repeat_days", 0)
-        flag  = f" 🔁{rpt}d" if rpt >= 2 else ""
+        flag  = f" 🔁{rpt}d" if rpt >= 3 else ""
         name  = get_ticker_name(c["ticker"])
         name_str = f" <i>({name})</i>" if name else ""
         return (
