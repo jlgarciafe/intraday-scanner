@@ -1286,7 +1286,7 @@ def _is_speculative(c: dict) -> bool:
 def format_telegram(candidates: list) -> str:
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
     lines = [
-        f"📊 <b>Intraday Scanner — {now}</b>",
+        f"📊 <b>TOP MOVERS — {now}</b>",
         f"Market: {MARKET_CONTEXT.upper()} | Target: >{MIN_MOVE_PCT}% | "
         f"Universe: {_STATS['universe_total']:,} | Found: {len(candidates)}",
         "",

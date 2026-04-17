@@ -139,7 +139,7 @@ def find_support_resistance(df, current_price):
 
 def run_ta_entry(ticker, scanner_data=None):
     result = {
-        "ticker": ticker, "status": "error", "error": None,
+        "ticker": ticker, "name": ticker, "status": "error", "error": None,
         "current_price": None, "currency": "USD",
         "entry_low": None, "entry_high": None,
         "stop_loss": None, "stop_pct": None,
@@ -177,6 +177,7 @@ def run_ta_entry(ticker, scanner_data=None):
         try:
             info = yf.Ticker(ticker).info
             result["currency"] = info.get("currency", "USD")
+            result["name"] = info.get("longName") or info.get("shortName") or ticker
             ed = info.get("earningsDate") or info.get("earningsTimestamp")
             if ed:
                 if isinstance(ed, (int, float)):
@@ -343,41 +344,64 @@ def rank_by_return_probability(actionable, top_n=TOP_N):
 # OUTPUT FORMATTERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def format_best_opportunities_summary(top10: list, total_actionable: int, total_scanned: int) -> str:
+    now  = datetime.utcnow().strftime("%H:%M UTC")
+    lines = [
+        f"🎯 *BEST OPPORTUNITIES — {now}*",
+        f"Ranked by entry quality | {total_actionable} actionable from {total_scanned} scanned",
+        f"",
+    ]
+    verdict_tag = lambda v: "✅ ENTER" if v.startswith("ENTER") else ("⏳ DIP" if v.startswith("WAIT FOR DIP") else "⏳ BRKOUT")
+    for i, r in enumerate(top10, 1):
+        sym    = r.get("ticker", "?")
+        name   = r.get("name", sym)
+        trend  = r.get("trend_primary", "-")
+        rsi    = r.get("rsi", "-")
+        tag    = verdict_tag(r.get("verdict", ""))
+        lines.append(f"{i}. *{sym}* ({name}) | {trend} | RSI {rsi} | {tag}")
+    lines += ["", "_Detail cards follow_ ↓"]
+    return "\n".join(lines)
+
+
 def format_telegram_card(r, rank):
-    ccy     = r.get("currency", "USD")
-    sym     = r.get("ticker", "?")
-    price   = r.get("current_price", 0)
-    mid     = (r["entry_low"] + r["entry_high"]) / 2
-    entry   = f"{r['entry_low']:.2f}-{r['entry_high']:.2f}"
-    stop    = f"{r['stop_loss']:.2f} (-{r['stop_pct']:.1f}%)"
-    t1_pct  = (r["target_1"] - mid) / mid * 100
-    t2_pct  = (r["target_2"] - mid) / mid * 100
-    ex_pct  = (r["recommended_exit"] - mid) / mid * 100
-    t1      = f"{r['target_1']:.2f} (+{t1_pct:.1f}%) R/R {r['rr_t1']:.1f}:1"
-    t2      = f"{r['target_2']:.2f} (+{t2_pct:.1f}%) R/R {r['rr_t2']:.1f}:1"
-    ex      = f"{r['recommended_exit']:.2f} (+{ex_pct:.1f}%) R/R {r['rr_exit']:.1f}:1"
+    ccy      = r.get("currency", "USD")
+    sym      = r.get("ticker", "?")
+    name     = r.get("name", sym)
+    price    = r.get("current_price", 0)
+    mid      = (r["entry_low"] + r["entry_high"]) / 2
+    entry    = f"{r['entry_low']:.2f} - {r['entry_high']:.2f}"
+    stop     = f"{r['stop_loss']:.2f}  (-{r['stop_pct']:.1f}%)"
+    t1_pct   = (r["target_1"] - mid) / mid * 100
+    t2_pct   = (r["target_2"] - mid) / mid * 100
+    ex_pct   = (r["recommended_exit"] - mid) / mid * 100
+    t1       = f"{r['target_1']:.2f}  (+{t1_pct:.1f}%)  R/R {r['rr_t1']:.1f}:1"
+    t2       = f"{r['target_2']:.2f}  (+{t2_pct:.1f}%)  R/R {r['rr_t2']:.1f}:1"
+    ex       = f"{r['recommended_exit']:.2f}  (+{ex_pct:.1f}%)  R/R {r['rr_exit']:.1f}:1"
     verdict  = r.get("verdict", "-")
+    momentum = r.get("momentum_st", "-")
     catalyst = r.get("catalyst_note") or "No near-term catalyst"
 
     if verdict.startswith("ENTER"):
-        tag = "[ENTER NOW]"
+        tag = "✅ ENTER NOW"
     elif verdict.startswith("WAIT FOR DIP"):
-        tag = "[WAIT - DIP]"
+        tag = f"⏳ WAIT — DIP  ({verdict})"
     else:
-        tag = "[WAIT - BRKOUT]"
+        tag = f"⏳ WAIT — BREAKOUT  ({verdict})"
 
     return "\n".join([
-        f"#{rank} {sym} | {ccy} {price:.2f} | {r.get('trend_primary','-')} | RSI {r.get('rsi','-')}",
+        f"*#{rank} {sym}* ({name})",
+        f"{ccy} {price:.2f} | {r.get('trend_primary', '-')} | RSI {r.get('rsi', '-')}",
         f"",
-        f"Entry:  {ccy} {entry}",
-        f"Stop:   {ccy} {stop}",
-        f"T1:     {ccy} {t1}",
-        f"T2:     {ccy} {t2}",
-        f"Exit:   {ccy} {ex}",
+        f"Entry:    {ccy} {entry}",
+        f"Stop:     {ccy} {stop}",
+        f"T1:       {ccy} {t1}",
+        f"T2:       {ccy} {t2}",
+        f"Exit:     {ccy} {ex}",
         f"",
-        f"{tag} {verdict}",
+        f"Momentum: {momentum}",
         f"Catalyst: {catalyst}",
-        f"-----------------------------",
+        f"{tag}",
+        f"─────────────────────────────",
     ])
 
 
@@ -526,19 +550,14 @@ def main():
         f.write("\n".join(md))
     print("ta_report.md written")
 
-    # Send Telegram — header + top 10 cards ranked best-first
+    # Send Telegram — summary list first, then individual cards
     if top10:
-        send_telegram(
-            f"TA Entry -- {now_str}\n"
-            f"Top {len(top10)} setups ranked by return probability\n"
-            f"({len(actionable)} actionable from {len(tickers)} scanned)\n"
-            f"------------------------------"
-        )
+        send_telegram(format_best_opportunities_summary(top10, len(actionable), len(tickers)))
         for i, r in enumerate(top10, 1):
             send_telegram(format_telegram_card(r, rank=i))
     else:
         send_telegram(
-            f"TA Runner -- {now_str}\n"
+            f"🎯 *BEST OPPORTUNITIES — {now_str}*\n"
             f"0 actionable setups from {len(tickers)} scanned."
         )
 
