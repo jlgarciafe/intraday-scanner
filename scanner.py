@@ -1293,14 +1293,24 @@ def format_telegram(candidates: list) -> str:
     ]
 
     def tier_sort(lst):
-        """Sort by repeat_days desc first, then score desc — repeaters bubble up."""
-        return sorted(lst, key=lambda x: (x.get("repeat_days", 0), x["score"]), reverse=True)
+        """Sort: building trend (↑) first, then days desc, then score desc."""
+        trend_rank = {"↑": 2, "→": 1, "↓": 0, "": -1}
+        return sorted(
+            lst,
+            key=lambda x: (
+                trend_rank.get(x.get("score_trend", ""), -1),
+                x.get("repeat_days", 0),
+                x["score"],
+            ),
+            reverse=True,
+        )
 
     def fmt(c: dict, i: int) -> str:
         e     = "🟢" if c["day_return"] > 0 else "🔴"
         label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
         rpt   = c.get("repeat_days", 0)
-        flag  = f" 🔁{rpt}d" if rpt >= 3 else ""
+        trend = c.get("score_trend", "")
+        flag  = f" 🔁{rpt}d{trend}" if rpt >= 3 else ""
         name  = get_ticker_name(c["ticker"])
         name_str = f" <i>({name})</i>" if name else ""
         return (
@@ -1405,9 +1415,8 @@ def save_scan_history(history: dict, candidates: list) -> None:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     existing = history["daily"].get(today, {})
     for c in candidates:
-        existing[c["ticker"]] = c.get("tier", "stock")
+        existing[c["ticker"]] = {"tier": c.get("tier", "stock"), "score": c.get("score", 0)}
     history["daily"][today] = existing
-    # Retain only the 7 most recent dates
     all_dates = sorted(history["daily"].keys(), reverse=True)
     history["daily"] = {d: history["daily"][d] for d in all_dates[:7]}
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -1415,13 +1424,37 @@ def save_scan_history(history: dict, candidates: list) -> None:
     logger.info(f"Scan history saved — {len(history['daily'])} day(s) on record")
 
 
-def compute_repeat_days(ticker: str, history: dict) -> int:
-    """Count distinct past days (excluding today) this ticker appeared in scans."""
+def compute_persistence(ticker: str, history: dict) -> dict:
+    """
+    Return how many distinct past days a ticker qualified and which direction
+    its score is trending.
+
+    trend:
+      '↑'  score rose  >=5 pts from first to last recorded day  (momentum building)
+      '↓'  score fell  >=5 pts                                   (momentum fading)
+      '→'  score flat  within ±5 pts                             (sustained)
+      ''   fewer than 2 past days — not enough data
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return sum(
-        1 for date, tickers in history["daily"].items()
-        if date != today and ticker in tickers
-    )
+    past = []
+    for date in sorted(history["daily"].keys()):
+        if date == today:
+            continue
+        entry = history["daily"][date].get(ticker)
+        if entry is None:
+            continue
+        # backward-compat: old entries stored just the tier string
+        score = entry.get("score", 0) if isinstance(entry, dict) else 0
+        past.append(score)
+
+    days = len(past)
+    if days < 2:
+        trend = ""
+    else:
+        delta = past[-1] - past[0]
+        trend = "↑" if delta >= 5 else ("↓" if delta <= -5 else "→")
+
+    return {"days": days, "trend": trend}
 
 
 def main():
@@ -1436,13 +1469,18 @@ def main():
     history    = load_scan_history()
     candidates = run_all_markets()
 
-    # Tag each candidate with how many previous days it appeared
+    # Tag each candidate with persistence data (days + score trend)
     for c in candidates:
-        c["repeat_days"] = compute_repeat_days(c["ticker"], history)
+        p = compute_persistence(c["ticker"], history)
+        c["repeat_days"]  = p["days"]
+        c["score_trend"]  = p["trend"]
 
-    repeaters = [c for c in candidates if c["repeat_days"] >= 2]
+    repeaters = [c for c in candidates if c["repeat_days"] >= 3]
     if repeaters:
-        logger.info(f"Repeat candidates (>=2 days): {[c['ticker'] for c in repeaters]}")
+        logger.info(
+            f"Trend candidates (>=3 days): "
+            + ", ".join(f"{c['ticker']}({c['repeat_days']}d{c['score_trend']})" for c in repeaters)
+        )
 
     save_scan_history(history, candidates)
 
