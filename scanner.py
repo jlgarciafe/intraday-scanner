@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
-  INTRADAY MOMENTUM SCANNER v5 — Dynamic Universe + ETF/Futures Tiers
+  INTRADAY MOMENTUM SCANNER v6 — Dynamic Universe + ETF/Futures Tiers + 11 Markets
 
   Architecture:
     Stage 1 — Fetch full index constituents dynamically (Wikipedia/free APIs)
@@ -24,6 +24,10 @@
     ES  — Ibex 35 (35 stocks) via Wikipedia
     FR  — CAC 40 (40 stocks) via Wikipedia
     HK  — Hang Seng (82 stocks) via Wikipedia
+    IN  — Nifty 50 (50 stocks, .NS suffix) via Wikipedia
+    AU  — S&P/ASX 200 (200 stocks, .AX suffix) via Wikipedia
+    CA  — S&P/TSX 60 (60 stocks, .TO suffix) via Wikipedia
+    KR  — KOSPI 200 (200 stocks, .KS suffix) via Wikipedia
 
   ⚠️  RISK DISCLAIMER:
   Consistently achieving >5% net daily returns is statistically rare and
@@ -77,6 +81,10 @@ PRESCREEN_MIN_VOL  = {      # Minimum absolute volume per market (stock tier)
     "es": 50_000,
     "hk": 100_000,
     "fr": 50_000,
+    "in": 100_000,
+    "au": 50_000,
+    "ca": 100_000,
+    "kr": 100_000,
 }
 MAX_PRESCREEN_PASS = 60     # Max stocks to run full analysis on per market
 
@@ -161,8 +169,66 @@ FEE_MODEL = {
     "es":      {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
     "hk":      {"commission_pct": 0.080, "spread_pct": 0.10,  "slippage_pct": 0.10},
     "fr":      {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "in":      {"commission_pct": 0.150, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "au":      {"commission_pct": 0.100, "spread_pct": 0.10,  "slippage_pct": 0.10},
+    "ca":      {"commission_pct": 0.100, "spread_pct": 0.08,  "slippage_pct": 0.08},
+    "kr":      {"commission_pct": 0.150, "spread_pct": 0.12,  "slippage_pct": 0.12},
     "futures": {"commission_pct": 0.002, "spread_pct": 0.01,  "slippage_pct": 0.02},
 }
+
+# ── Ticker display names ──────────────────────────────────────────────────────
+_TICKER_NAMES: dict = {
+    # ETFs — broad index
+    "SPY": "S&P 500 ETF", "QQQ": "Nasdaq 100 ETF", "IWM": "Russell 2000 ETF",
+    "DIA": "Dow Jones ETF", "VOO": "Vanguard S&P 500", "VTI": "Total Market ETF",
+    "MDY": "S&P 400 Mid-Cap ETF",
+    # ETFs — international
+    "EFA": "Intl Developed Mkts", "EWG": "Germany ETF", "EWU": "UK ETF",
+    "EWQ": "France ETF", "EWP": "Spain ETF", "EWJ": "Japan ETF",
+    "EWH": "Hong Kong ETF", "FXI": "China Large-Cap ETF", "EEM": "Emerging Mkts ETF",
+    # ETFs — US sector
+    "XLF": "Financials ETF", "XLE": "Energy ETF", "XLK": "Technology ETF",
+    "XLV": "Healthcare ETF", "XLI": "Industrials ETF", "XLU": "Utilities ETF",
+    "XLP": "Cons Staples ETF", "XLB": "Materials ETF", "XLRE": "Real Estate ETF",
+    "XLC": "Comms Services ETF",
+    # ETFs — tech / semis
+    "SMH": "Semiconductor ETF", "SOXX": "iShares Semis ETF", "ARKK": "ARK Innovation ETF",
+    # ETFs — volatility / inverse
+    "UVXY": "Short-Term VIX ETF", "SQQQ": "Nasdaq 3x Inverse", "SPXS": "S&P 3x Inverse",
+    # Futures — equity index
+    "ES=F": "S&P 500 Futures", "NQ=F": "Nasdaq 100 Futures",
+    "RTY=F": "Russell 2000 Futures", "YM=F": "Dow Jones Futures",
+    # Futures — bonds
+    "ZN=F": "10-Yr T-Note Futures", "ZB=F": "30-Yr T-Bond Futures",
+    # Futures — commodities
+    "CL=F": "Crude Oil Futures", "NG=F": "Natural Gas Futures",
+    "GC=F": "Gold Futures", "SI=F": "Silver Futures", "HG=F": "Copper Futures",
+    "PL=F": "Platinum Futures", "PA=F": "Palladium Futures",
+    # Futures — FX / vol / crypto
+    "6E=F": "Euro Futures", "6J=F": "Japanese Yen Futures",
+    "VX=F": "VIX Futures", "BTC=F": "Bitcoin Futures",
+}
+
+_name_cache: dict = {}
+
+
+def get_ticker_name(ticker: str) -> str:
+    """Return human-readable name for a ticker. Hardcoded dict first, then yfinance."""
+    if ticker in _TICKER_NAMES:
+        return _TICKER_NAMES[ticker]
+    if ticker in _name_cache:
+        return _name_cache[ticker]
+    try:
+        info = yf.Ticker(ticker).info
+        name = info.get("longName") or info.get("shortName") or ""
+        if name:
+            _name_cache[ticker] = name
+            return name
+    except Exception:
+        pass
+    _name_cache[ticker] = ""
+    return ""
+
 
 # ── Global run stats ──────────────────────────────────────────────────────────
 _STATS = {
@@ -476,6 +542,10 @@ def get_universe(market_key: str) -> list:
         "es": fetch_ibex35,
         "fr": fetch_cac40,
         "hk": fetch_hangseng,
+        "in": fetch_nifty50,
+        "au": fetch_asx200,
+        "ca": fetch_tsx60,
+        "kr": fetch_kospi,
     }
     fn = fetchers.get(market_key)
     if fn:
@@ -536,6 +606,117 @@ def _hangseng_fallback():
         "0700","0005","0939","1299","0941","2318","0388","1398","2628","0003",
         "0011","0002","0016","0027","1810","9988","0175","1177","2020","6862",
     ]]
+
+
+def fetch_nifty50() -> list:
+    """Nifty 50 constituents from Wikipedia (.NS suffix)."""
+    try:
+        url = "https://en.wikipedia.org/wiki/NIFTY_50"
+        tables = _wiki_tables(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("symbol" in c or "ticker" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["symbol","ticker"])][0]
+                tickers = [f"{str(s).strip()}.NS" if not str(s).endswith(".NS") else s
+                           for s in t[col].dropna().tolist() if str(s).strip()]
+                tickers = [tk for tk in tickers if len(tk) > 3]
+                logger.info(f"  Nifty 50: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No symbol column found")
+    except Exception as e:
+        logger.warning(f"  Nifty 50 fetch failed: {e} — using fallback")
+        return _nifty50_fallback()
+
+
+def fetch_asx200() -> list:
+    """S&P/ASX 200 constituents from Wikipedia (.AX suffix)."""
+    try:
+        url = "https://en.wikipedia.org/wiki/S%26P/ASX_200"
+        tables = _wiki_tables(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("ticker" in c or "code" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["ticker","code","symbol"])][0]
+                tickers = [f"{str(s).strip()}.AX" if not str(s).endswith(".AX") else s
+                           for s in t[col].dropna().tolist() if str(s).strip()]
+                tickers = [tk for tk in tickers if len(tk) > 3]
+                logger.info(f"  ASX 200: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  ASX 200 fetch failed: {e} — using fallback")
+        return _asx200_fallback()
+
+
+def fetch_tsx60() -> list:
+    """S&P/TSX 60 constituents from Wikipedia (.TO suffix)."""
+    try:
+        url = "https://en.wikipedia.org/wiki/S%26P/TSX_60"
+        tables = _wiki_tables(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("ticker" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["ticker","symbol"])][0]
+                tickers = [f"{str(s).strip()}.TO" if not str(s).endswith(".TO") else s
+                           for s in t[col].dropna().tolist() if str(s).strip()]
+                tickers = [tk for tk in tickers if len(tk) > 3]
+                logger.info(f"  TSX 60: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No ticker column found")
+    except Exception as e:
+        logger.warning(f"  TSX 60 fetch failed: {e} — using fallback")
+        return _tsx60_fallback()
+
+
+def fetch_kospi() -> list:
+    """KOSPI 200 constituents from Wikipedia (.KS suffix)."""
+    try:
+        url = "https://en.wikipedia.org/wiki/KOSPI_200"
+        tables = _wiki_tables(url)
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if any("code" in c or "ticker" in c or "symbol" in c for c in cols):
+                col = [c for c in t.columns if any(k in c.lower() for k in ["code","ticker","symbol"])][0]
+                tickers = [f"{str(s).strip().zfill(6)}.KS" if not str(s).endswith(".KS") else s
+                           for s in t[col].dropna().tolist()
+                           if str(s).strip().replace(" ","").replace("-","").isdigit()]
+                logger.info(f"  KOSPI 200: {len(tickers)} constituents fetched")
+                return tickers
+        raise ValueError("No code column found")
+    except Exception as e:
+        logger.warning(f"  KOSPI 200 fetch failed: {e} — using fallback")
+        return _kospi_fallback()
+
+
+def _nifty50_fallback():
+    return [f"{t}.NS" for t in [
+        "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","KOTAKBANK",
+        "SBIN","BAJFINANCE","BHARTIARTL","ITC","AXISBANK","LT","WIPRO","ULTRACEMCO",
+        "HCLTECH","SUNPHARMA","TITAN","ASIANPAINT","MARUTI","ADANIENT","POWERGRID",
+        "NTPC","TECHM","BAJAJFINSV","NESTLEIND","ONGC","DIVISLAB","DRREDDY","EICHERMOT",
+    ]]
+
+def _asx200_fallback():
+    return [f"{t}.AX" for t in [
+        "BHP","CBA","CSL","NAB","ANZ","WBC","WES","MQG","RIO","WOW",
+        "TCL","TLS","GMG","MIN","FMG","NCM","REA","COL","STO","QAN",
+        "AGL","ASX","AMC","AMP","ALX","BXB","IAG","MPL","ORG","SHL",
+    ]]
+
+def _tsx60_fallback():
+    return [f"{t}.TO" for t in [
+        "RY","TD","BNS","BMO","CM","MFC","SLF","ENB","CNQ","TRP",
+        "SU","CNR","CP","BCE","T","SHOP","BAM","ATD","WN","ABX",
+        "IMO","CVE","CCO","QSR","POW","GIB-A","DOL","L","EMA","FTS",
+    ]]
+
+def _kospi_fallback():
+    return [
+        "005930.KS","000660.KS","035420.KS","005380.KS","051910.KS",
+        "006400.KS","035720.KS","207940.KS","068270.KS","055550.KS",
+        "105560.KS","012330.KS","028260.KS","066570.KS","032830.KS",
+        "086790.KS","017670.KS","030200.KS","010950.KS","096770.KS",
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -985,11 +1166,11 @@ def run_all_markets() -> list:
     })
 
     if MARKET_CONTEXT == "all":
-        markets = ["us", "uk", "de", "jp", "es", "hk", "fr"]
+        markets = ["us", "uk", "de", "jp", "es", "hk", "fr", "in", "au", "ca", "kr"]
     elif MARKET_CONTEXT == "eu":
         markets = ["uk", "de", "es", "fr"]
     elif MARKET_CONTEXT == "asia":
-        markets = ["jp", "hk"]
+        markets = ["jp", "hk", "in", "kr"]
     else:
         markets = [MARKET_CONTEXT] if MARKET_CONTEXT in FEE_MODEL else ["us"]
 
@@ -1118,8 +1299,10 @@ def format_telegram(candidates: list) -> str:
         label = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
         rpt   = c.get("repeat_days", 0)
         flag  = f" 🔁{rpt}d" if rpt >= 2 else ""
+        name  = get_ticker_name(c["ticker"])
+        name_str = f" <i>({name})</i>" if name else ""
         return (
-            f"{i}. [{label}] <b>{c['ticker']}</b>{flag} {e}{c['day_return']:+.1f}% | "
+            f"{i}. [{label}] <b>{c['ticker']}</b>{name_str}{flag} {e}{c['day_return']:+.1f}% | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
 
@@ -1241,7 +1424,7 @@ def compute_repeat_days(ticker: str, history: dict) -> int:
 
 def main():
     logger.info("=" * 60)
-    logger.info("INTRADAY MOMENTUM SCANNER v5 — Dynamic Universe + ETF/Futures Tiers")
+    logger.info("INTRADAY MOMENTUM SCANNER v6 — Dynamic Universe + ETF/Futures Tiers + 11 Markets")
     logger.info(f"Market:  {MARKET_CONTEXT.upper()}")
     logger.info(f"Target:  >{MIN_MOVE_PCT}%")
     logger.info(f"Mode:    {'DRY RUN' if DRY_RUN else 'LIVE'}")

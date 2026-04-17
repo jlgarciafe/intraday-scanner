@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       market:
-        description: "Market (all / us / uk / de / jp / es / hk / fr / eu / asia)"
+        description: "Market (all / us / uk / de / jp / es / hk / fr / in / au / ca / kr / eu / asia)"
         required: false
         default: "all"
         type: string
