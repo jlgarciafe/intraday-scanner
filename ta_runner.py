@@ -355,11 +355,12 @@ def format_best_opportunities_summary(top10: list, total_actionable: int, total_
     def _short(name, max_len=25):
         return name if len(name) <= max_len else name[:max_len - 1] + "…"
 
+    trend_tag   = lambda t: "MA↑" if t == "UPTREND" else ("MA→" if t == "MIXED" else "MA↓")
     verdict_tag = lambda v: "✅ ENTER" if v.startswith("ENTER") else ("⏳ DIP" if v.startswith("WAIT FOR DIP") else "⏳ BRKOUT")
     for i, r in enumerate(top10, 1):
         sym    = r.get("ticker", "?")
         name   = _short(r.get("name", sym))
-        trend  = r.get("trend_primary", "-")
+        trend  = trend_tag(r.get("trend_primary", ""))
         rsi    = r.get("rsi", "-")
         tag    = verdict_tag(r.get("verdict", ""))
         lines.append(f"{i}. *{sym}* ({name}) | {trend} | RSI {rsi} | {tag}")
@@ -392,9 +393,10 @@ def format_telegram_card(r, rank):
     else:
         tag = f"⏳ WAIT — BREAKOUT  ({verdict})"
 
+    trend_tag = {"UPTREND": "MA↑", "MIXED": "MA→", "DOWNTREND": "MA↓"}.get(r.get("trend_primary", ""), "MA→")
     return "\n".join([
         f"*#{rank} {sym}* ({name})",
-        f"{ccy} {price:.2f} | {r.get('trend_primary', '-')} | RSI {r.get('rsi', '-')}",
+        f"{ccy} {price:.2f} | {trend_tag} | RSI {r.get('rsi', '-')}",
         f"",
         f"Entry:    {ccy} {entry}",
         f"Stop:     {ccy} {stop}",
