@@ -1022,6 +1022,8 @@ def main():
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--tickers",   nargs="+", help="Space-separated tickers")
     group.add_argument("--from-file", help="Path to scan_results.json")
+    parser.add_argument("--skip-email", action="store_true",
+                        help="Skip email sending (used when send_report.py handles it)")
     args = parser.parse_args()
 
     if args.tickers:
@@ -1069,6 +1071,7 @@ def main():
         {
             "rank":             i + 1,
             "ticker":           r["ticker"],
+            "name":             r.get("name", r["ticker"]),
             "currency":         r["currency"],
             "timestamp_utc":    datetime.utcnow().isoformat(),
             "current_price":    r["current_price"],
@@ -1089,6 +1092,16 @@ def main():
             "ma200":            r["ma200"],
             "week52_low":       r["week52_low"],
             "week52_high":      r["week52_high"],
+            # Enriched fields for ta_narrative.py
+            "bias":             r.get("bias", "LONG"),
+            "catalyst_tier":    r.get("catalyst_tier", "B"),
+            "trend_primary":    r.get("trend_primary", ""),
+            "trend_secondary":  r.get("trend_secondary", ""),
+            "momentum_st":      r.get("momentum_st", ""),
+            "adx":              r.get("adx"),
+            "day_return":       r.get("day_return"),
+            "rvol":             r.get("rvol"),
+            "rs_vs_bench":      r.get("rs_vs_bench"),
         }
         for i, r in enumerate(top10)
     ]
@@ -1124,12 +1137,16 @@ def main():
             f"0 actionable setups from {len(tickers)} scanned."
         )
 
-    # ── Excel report + email ──────────────────────────────────────────────────
-    xl_path = f"scan_report_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.xlsx"
+    # ── Excel report (always generated — needed as artifact + for send_report.py) ─
+    xl_path        = f"scan_report_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.xlsx"
+    all_candidates = list(scanner_data.values()) if scanner_data else []
     try:
-        generate_excel_report(scan_data, top10, filepath=xl_path)
+        generate_excel_report(all_candidates, top10, filepath=xl_path)
         print(f"Excel report written: {xl_path}")
-        send_email_report(xl_path, subject_suffix=now_str)
+        if args.skip_email:
+            print("Email deferred (--skip-email) — send_report.py will handle it")
+        else:
+            send_email_report(xl_path, subject_suffix=now_str)
     except ImportError:
         print("WARN: openpyxl not installed — skipping Excel report")
     except Exception as e:
