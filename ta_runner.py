@@ -337,7 +337,11 @@ def run_ta_entry(ticker, scanner_data=None):
             exit_price = next((s for s in supports if s < t2 * 0.98), None)
             if exit_price is None:
                 exit_price = round(entry_mid - 4 * risk, 4)
-            exit_price = max(exit_price, round(result["week52_low"] * 1.05, 4))
+            # Apply 52w low floor only when it still leaves room below T2
+            w52_floor = round(result["week52_low"] * 1.05, 4)
+            if w52_floor < t2:
+                exit_price = max(exit_price, w52_floor)
+            exit_price = min(exit_price, round(t2 * 0.98, 4))  # ceiling: always below T2
             rr_exit    = round((entry_mid - exit_price) / risk, 2)
 
             result["target_1"]         = round(t1, 4)
@@ -411,7 +415,11 @@ def run_ta_entry(ticker, scanner_data=None):
             exit_price = next((r for r in resistances if r > t2 * 1.02), None)
             if exit_price is None:
                 exit_price = round(entry_mid + 4 * risk, 4)
-            exit_price = min(exit_price, round(result["week52_high"] * 0.95, 4))
+            # Apply 52w high cap only when it still leaves room above T2
+            w52_cap = round(result["week52_high"] * 0.95, 4)
+            if w52_cap > t2:
+                exit_price = min(exit_price, w52_cap)
+            exit_price = max(exit_price, round(t2 * 1.02, 4))  # floor: always above T2
             rr_exit    = round((exit_price - entry_mid) / risk, 2)
 
             result["target_1"]         = round(t1, 4)
