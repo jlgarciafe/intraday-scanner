@@ -210,7 +210,13 @@ def build_table_html(orders: list, ratings: dict) -> str:
             rr_val   = o.get("rr_exit")
             rr       = f"{rr_val:.1f}×" if rr_val and rating not in ("HOLD","EXIT") else "—"
             catalyst = o.get("catalyst") or "None"
-            verdict  = short_verdict(o.get("verdict", ""))
+            # HOLD/EXIT rows: override verdict to match Claude's rating
+            if rating == "HOLD":
+                verdict = "Hold"
+            elif rating == "EXIT":
+                verdict = "Pass · decay"
+            else:
+                verdict = short_verdict(o.get("verdict", ""))
 
             # Ticker cell: bold ticker + small name below
             ticker_cell = (
