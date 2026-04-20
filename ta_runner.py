@@ -176,37 +176,50 @@ def find_support_resistance(df, current_price):
 def compute_position_sizing(entry_mid: float, stop_loss: float,
                             capital: float = CAPITAL_EUR,
                             risk_pct: float = RISK_PCT,
-                            fx_rate: float = 1.0) -> dict:
+                            fx_rate: float = 1.0,
+                            adv_20: float = None) -> dict:
     """
-    FX-aware fixed-risk position sizing.
+    FX-aware fixed-risk position sizing with two hard caps (Improvement 6).
 
-    fx_rate : units of the stock's local currency per 1 EUR
-              e.g. 1550.0 for KRW, 1.08 for USD, 0.85 for GBP, 1.0 for EUR
-
-    Steps:
-        risk_eur       = capital × risk_pct                (in EUR)
-        risk_local     = risk_eur × fx_rate                (converted to local ccy)
-        stop_dist      = |entry - stop|                    (in local ccy)
-        num_shares     = risk_local / stop_dist
-        position_local = num_shares × entry                (in local ccy)
-        position_eur   = position_local / fx_rate          (EUR equivalent)
-
-    Returns a sizing dict, or None if stop_distance is invalid.
+    Cap 1 — ADV: never trade > 10 % of the 20-day average daily volume.
+    Cap 2 — Concentration: never put > 20 % of capital into a single position.
     """
     risk_eur      = capital * risk_pct
     risk_local    = risk_eur * fx_rate
     stop_distance = abs(entry_mid - stop_loss)
     if stop_distance <= 0:
         return None
-    num_shares     = risk_local / stop_distance
-    position_local = num_shares * entry_mid
-    position_eur   = position_local / fx_rate
+
+    num_shares = risk_local / stop_distance
+    capped_by  = None
+
+    # Cap 1: ADV — max 10 % of 20-day average daily volume
+    if adv_20 and adv_20 > 0:
+        adv_cap = adv_20 * 0.10
+        if num_shares > adv_cap:
+            num_shares = adv_cap
+            capped_by  = "ADV"
+
+    # Cap 2: max 20 % of capital in one name
+    max_pos_local = (capital * 0.20) * fx_rate
+    pos_local     = num_shares * entry_mid
+    if pos_local > max_pos_local:
+        num_shares = max_pos_local / entry_mid
+        capped_by  = "MAX_POS" if capped_by is None else f"{capped_by}+MAX_POS"
+
+    num_shares  = max(1, int(round(num_shares)))
+    pos_local   = num_shares * entry_mid
+    pos_eur     = pos_local / fx_rate
+    risk_actual = num_shares * stop_distance
+    risk_act_eur= risk_actual / fx_rate
+
     return {
-        "risk_eur":       round(risk_eur),
-        "position_eur":   round(position_eur),
-        "position_local": round(position_local),
-        "num_shares":     int(round(num_shares)),
-        "risk_pct_used":  round(risk_pct * 100, 1),
+        "risk_eur":        round(risk_act_eur),
+        "position_eur":    round(pos_eur),
+        "position_local":  round(pos_local),
+        "num_shares":      num_shares,
+        "risk_pct_used":   round(risk_pct * 100, 1),
+        "sizing_capped_by": capped_by,
     }
 
 
@@ -239,6 +252,17 @@ def run_ta_entry(ticker, scanner_data=None):
         # Improvement 1 + 4: news and weekly trend from scanner
         "has_news_today": False, "news_headline": "",
         "weekly_trend_up": None,
+        # Improvements 3, 5, 6, 7, 8, 9, 10, 11
+        "rs_vs_sector":          None,
+        "short_interest_pct":    None,
+        "earnings_surprise_avg": None,
+        "futures_roll_warning":  False,
+        "days_to_roll":          None,
+        "roll_date":             None,
+        "repeat_days":           0,
+        "score_trend":           "→",
+        "sizing_capped_by":      None,
+        "corr_flag":             [],
     }
 
     # ── Inherit scanner context early — bias is needed before level calculations
@@ -248,9 +272,17 @@ def run_ta_entry(ticker, scanner_data=None):
         result["rs_vs_bench"]     = scanner_data.get("rs_vs_bench")
         result["day_return"]      = scanner_data.get("day_return")
         result["rvol"]            = scanner_data.get("rvol")
-        result["has_news_today"]  = scanner_data.get("has_news_today", False)
-        result["news_headline"]   = scanner_data.get("news_headline", "")
-        result["weekly_trend_up"] = scanner_data.get("weekly_trend_up")
+        result["has_news_today"]        = scanner_data.get("has_news_today", False)
+        result["news_headline"]         = scanner_data.get("news_headline", "")
+        result["weekly_trend_up"]       = scanner_data.get("weekly_trend_up")
+        result["rs_vs_sector"]          = scanner_data.get("rs_vs_sector")
+        result["short_interest_pct"]    = scanner_data.get("short_interest_pct")
+        result["earnings_surprise_avg"] = scanner_data.get("earnings_surprise_avg")
+        result["futures_roll_warning"]  = scanner_data.get("futures_roll_warning", False)
+        result["days_to_roll"]          = scanner_data.get("days_to_roll")
+        result["roll_date"]             = scanner_data.get("roll_date")
+        result["repeat_days"]           = scanner_data.get("repeat_days", 0)
+        result["score_trend"]           = scanner_data.get("score_trend", "→")
     bias = result["bias"]
 
     try:
@@ -400,13 +432,15 @@ def run_ta_entry(ticker, scanner_data=None):
             result["recommended_exit"] = round(exit_price, 4)
             result["rr_exit"]          = rr_exit
 
-            sizing = compute_position_sizing(entry_mid, stop_loss, fx_rate=fx_rate)
+            adv_20 = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else None
+            sizing = compute_position_sizing(entry_mid, stop_loss, fx_rate=fx_rate, adv_20=adv_20)
             if sizing:
                 result["position_size_eur"]   = sizing["position_eur"]
                 result["position_size_local"] = sizing["position_local"]
                 result["risk_eur"]            = sizing["risk_eur"]
                 result["num_shares"]          = sizing["num_shares"]
                 result["risk_pct_used"]       = sizing["risk_pct_used"]
+                result["sizing_capped_by"]    = sizing["sizing_capped_by"]
 
             # Verdict for SHORT
             at_support_sh = bool(supports and current_price <= supports[0] * 1.03)
@@ -479,13 +513,15 @@ def run_ta_entry(ticker, scanner_data=None):
             result["recommended_exit"] = round(exit_price, 4)
             result["rr_exit"]          = rr_exit
 
-            sizing = compute_position_sizing(entry_mid, stop_loss, fx_rate=fx_rate)
+            adv_20 = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else None
+            sizing = compute_position_sizing(entry_mid, stop_loss, fx_rate=fx_rate, adv_20=adv_20)
             if sizing:
                 result["position_size_eur"]   = sizing["position_eur"]
                 result["position_size_local"] = sizing["position_local"]
                 result["risk_eur"]            = sizing["risk_eur"]
                 result["num_shares"]          = sizing["num_shares"]
                 result["risk_pct_used"]       = sizing["risk_pct_used"]
+                result["sizing_capped_by"]    = sizing["sizing_capped_by"]
 
             at_support      = current_price <= nearest_support * 1.02
             near_resistance = bool(resistances and current_price >= resistances[0] * 0.97)
@@ -547,7 +583,12 @@ def rank_by_return_probability(actionable, top_n=TOP_N):
             rs = 20 if rsi <= 45 else (15 if rsi <= 55 else 5)
         else:
             rs = 20 if 40 <= rsi <= 65 else (15 if 65 < rsi <= 75 else 5)
-        return tier + vs + rr + ts + rs
+        # Improvement 8: penalise stale fading signals
+        # A ticker qualifying for 5+ consecutive days with declining score = momentum exhausted
+        repeat = r.get("repeat_days", 0)
+        trend_s = r.get("score_trend", "→")
+        staleness = -15 if (repeat >= 5 and trend_s == "↓") else (-5 if repeat >= 3 and trend_s == "↓" else 0)
+        return tier + vs + rr + ts + rs + staleness
 
     return sorted(actionable, key=score, reverse=True)[:top_n]
 
@@ -555,6 +596,60 @@ def rank_by_return_probability(actionable, top_n=TOP_N):
 # ─────────────────────────────────────────────────────────────────────────────
 # OUTPUT FORMATTERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def compute_correlation_flags(top10: list) -> None:
+    """
+    Improvement 11 — Correlation / portfolio overlap guard.
+    Compute 60-day return correlations for all top10 tickers.
+    Sets corr_flag = list of ticker strings with |corr| >= 0.75.
+    Modifies top10 in-place.
+    """
+    tickers = [r["ticker"] for r in top10]
+    for r in top10:
+        r["corr_flag"] = []
+    if len(tickers) < 2:
+        return
+    try:
+        end_dt   = datetime.utcnow()
+        start_dt = end_dt - timedelta(days=90)
+        raw = yf.download(
+            tickers,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            progress=False, auto_adjust=True,
+            group_by="ticker"
+        )
+        if raw is None or raw.empty:
+            return
+        # Build closes DataFrame
+        closes = {}
+        for t in tickers:
+            try:
+                if isinstance(raw.columns, __import__("pandas").MultiIndex):
+                    col_data = raw[t]["Close"] if t in raw.columns.get_level_values(0) else None
+                else:
+                    col_data = raw["Close"] if len(tickers) == 1 else None
+                if col_data is not None and len(col_data.dropna()) > 20:
+                    closes[t] = col_data.astype(float)
+            except Exception:
+                pass
+        if len(closes) < 2:
+            return
+        df_closes = __import__("pandas").DataFrame(closes).dropna()
+        rets      = df_closes.pct_change().dropna()
+        corr      = rets.corr()
+        for r in top10:
+            t = r["ticker"]
+            if t not in corr.columns:
+                continue
+            flagged = [
+                other for other in corr.columns
+                if other != t and abs(corr.loc[t, other]) >= 0.75
+            ]
+            r["corr_flag"] = flagged
+    except Exception:
+        pass
+
 
 def format_best_opportunities_summary(top10: list, total_actionable: int, total_scanned: int) -> str:
     now  = datetime.utcnow().strftime("%H:%M UTC")
@@ -720,6 +815,29 @@ def format_telegram_card(r, rank):
     ]
     if news_line:
         card_lines.append(news_line)
+
+    # Improvement 9: Short interest
+    si_pct = r.get("short_interest_pct")
+    if si_pct is not None:
+        si_flag = " 🔥 Squeeze watch" if si_pct >= 15 else ""
+        card_lines.append(f"Short int: {si_pct:.0f}%{si_flag}")
+
+    # Improvement 10: Earnings surprise history
+    earn_surp = r.get("earnings_surprise_avg")
+    if earn_surp is not None:
+        sign = "+" if earn_surp >= 0 else ""
+        card_lines.append(f"Avg EPS beat: {sign}{earn_surp:.0f}%")
+
+    # Improvement 7: Futures roll warning
+    if r.get("futures_roll_warning"):
+        dtroll = r.get("days_to_roll")
+        card_lines.append(f"⚠️ Futures roll in {dtroll}d — consider sizing down")
+
+    # Improvement 11: Correlation flag
+    corr_f = r.get("corr_flag", [])
+    if corr_f:
+        card_lines.append(f"⚠️ Correlated ≥0.75 with: {', '.join(corr_f)}")
+
     card_lines += [
         f"{tag}",
         f"─────────────────────────────",
@@ -1084,10 +1202,40 @@ def build_html_email(top10: list, run_time: str) -> str:
         has_news       = r.get("has_news_today", False)
         news_headline  = r.get("news_headline", "")
         name_disp      = (name[:20] + "…") if len(name) > 22 else name
-        news_badge     = ' <span title="News today" style="color:#C55A11;font-size:11px;">📰</span>' if has_news else ""
-        ticker_cell    = (
-            f'<strong style="font-size:13px;">{ticker}{news_badge}</strong>'
+        news_badge   = ' <span title="News today" style="color:#C55A11;font-size:11px;">📰</span>' if has_news else ""
+        roll_warn    = r.get("futures_roll_warning", False)
+        days_to_roll = r.get("days_to_roll")
+        roll_badge   = (f' <span title="Futures roll in {days_to_roll}d" '
+                        f'style="color:#C00000;font-size:10px;font-weight:bold;">⚠️ Roll {days_to_roll}d</span>'
+                        if roll_warn and days_to_roll is not None else "")
+        repeat       = r.get("repeat_days", 0)
+        strend       = r.get("score_trend", "→")
+        repeat_badge = (f'<br><span style="font-size:10px;color:#888888;">🔄 {repeat}d {strend}</span>'
+                        if repeat >= 2 else "")
+        rs_b         = r.get("rs_vs_bench")
+        rs_s         = r.get("rs_vs_sector")
+        corr_f       = r.get("corr_flag", [])
+        rs_line      = ""
+        if rs_b is not None or rs_s is not None:
+            parts = []
+            if rs_b is not None:
+                col = "#00B050" if rs_b >= 0 else "#C00000"
+                parts.append(f'<span style="color:{col};">RS idx: {rs_b:+.1f}%</span>')
+            if rs_s is not None:
+                col = "#00B050" if rs_s >= 0 else "#C00000"
+                parts.append(f'<span style="color:{col};">RS sec: {rs_s:+.1f}%</span>')
+            rs_line = f'<br><span style="font-size:10px;">{" | ".join(parts)}</span>'
+        corr_others  = ", ".join(corr_f[:2])
+        corr_title   = ", ".join(corr_f)
+        corr_line    = (
+            f'<br><span style="font-size:10px;color:#7030A0;" '
+            f'title="Correlated ≥0.75 with {corr_title}">⚠️ corr: {corr_others}</span>'
+            if corr_f else ""
+        )
+        ticker_cell  = (
+            f'<strong style="font-size:13px;">{ticker}{news_badge}{roll_badge}</strong>'
             f'<br><span style="font-size:10px;color:#666666;">{name_disp}</span>'
+            f'{repeat_badge}{rs_line}{corr_line}'
         )
 
         price  = f"{sym}{_fp(r.get('current_price'))}"
@@ -1111,17 +1259,29 @@ def build_html_email(top10: list, run_time: str) -> str:
         else:
             weekly_html = '<span style="color:#888888;">—</span>'
 
-        # ── Catalyst: show news headline if available ──
-        cat_note = r.get("catalyst_note") or "None"
+        # ── Catalyst: show SI, earnings surprise, news headline ──
+        cat_note    = r.get("catalyst_note") or "None"
+        si_pct      = r.get("short_interest_pct")
+        earn_surp   = r.get("earnings_surprise_avg")
+        cat_extras  = []
+        if si_pct is not None:
+            si_col = "#C00000" if si_pct >= 15 else "#888888"
+            cat_extras.append(
+                f'<span style="color:{si_col};font-size:10px;">SI: {si_pct:.0f}%</span>'
+            )
+        if earn_surp is not None:
+            es_col = "#00B050" if earn_surp >= 0 else "#C00000"
+            cat_extras.append(
+                f'<span style="color:{es_col};font-size:10px;">Avg beat: {earn_surp:+.0f}%</span>'
+            )
         if has_news and news_headline:
             short_hl = (news_headline[:55] + "…") if len(news_headline) > 57 else news_headline
-            cat_html = (
-                f'{cat_note}'
-                f'<br><span style="font-size:10px;color:#C55A11;font-style:italic;">'
-                f'📰 {short_hl}</span>'
+            cat_extras.append(
+                f'<span style="color:#C55A11;font-size:10px;font-style:italic;">📰 {short_hl}</span>'
             )
-        else:
-            cat_html = cat_note
+        cat_html = cat_note
+        if cat_extras:
+            cat_html += "<br>" + "<br>".join(cat_extras)
 
         rows.append(
             "<tr>"
@@ -1306,6 +1466,14 @@ def main():
     for i, r in enumerate(top10, 1):
         print(f"    {i}. {r['ticker']} | {r.get('trend_primary','-')} | {r.get('verdict','-')[:50]}")
 
+    # Improvement 11: correlation / overlap guard
+    compute_correlation_flags(top10)
+    corr_pairs = [(r["ticker"], r["corr_flag"]) for r in top10 if r.get("corr_flag")]
+    if corr_pairs:
+        print("  Correlation flags (|corr| ≥ 0.75):")
+        for t, others in corr_pairs:
+            print(f"    {t} ↔ {', '.join(others)}")
+
     # Write orders.json — top 10 only, ranked
     orders = [
         {
@@ -1342,10 +1510,20 @@ def main():
             "day_return":       r.get("day_return"),
             "rvol":             r.get("rvol"),
             "rs_vs_bench":      r.get("rs_vs_bench"),
-            # Improvements 1 + 4
-            "has_news_today":   r.get("has_news_today", False),
-            "news_headline":    r.get("news_headline", ""),
-            "weekly_trend_up":  r.get("weekly_trend_up"),
+            # Improvements 1, 3, 4, 5, 6, 7, 8, 9, 10, 11
+            "has_news_today":        r.get("has_news_today", False),
+            "news_headline":         r.get("news_headline", ""),
+            "weekly_trend_up":       r.get("weekly_trend_up"),
+            "rs_vs_sector":          r.get("rs_vs_sector"),
+            "short_interest_pct":    r.get("short_interest_pct"),
+            "earnings_surprise_avg": r.get("earnings_surprise_avg"),
+            "futures_roll_warning":  r.get("futures_roll_warning", False),
+            "days_to_roll":          r.get("days_to_roll"),
+            "roll_date":             r.get("roll_date"),
+            "repeat_days":           r.get("repeat_days", 0),
+            "score_trend":           r.get("score_trend", "→"),
+            "sizing_capped_by":      r.get("sizing_capped_by"),
+            "corr_flag":             r.get("corr_flag", []),
         }
         for i, r in enumerate(top10)
     ]

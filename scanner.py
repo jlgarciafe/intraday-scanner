@@ -47,7 +47,8 @@ import warnings
 warnings.filterwarnings("ignore")
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from calendar import monthcalendar, FRIDAY
 from typing import Optional
 import yfinance as yf
 
@@ -236,6 +237,114 @@ BENCHMARK_MAP = {
     "es": "EWP",  "fr": "EWQ",  "hk": "EWH",
     "in": "INDA", "au": "EWA",  "ca": "EWC",  "kr": "EWY",
 }
+
+# ── Sector ETF map (for RS vs sector, Improvement 5) ─────────────────────────
+SECTOR_ETF_MAP: dict = {
+    "Technology":             "XLK",
+    "Financial Services":     "XLF",
+    "Financials":             "XLF",
+    "Healthcare":             "XLV",
+    "Consumer Cyclical":      "XLY",
+    "Consumer Defensive":     "XLP",
+    "Industrials":            "XLI",
+    "Communication Services": "XLC",
+    "Energy":                 "XLE",
+    "Basic Materials":        "XLB",
+    "Materials":              "XLB",
+    "Real Estate":            "XLRE",
+    "Utilities":              "XLU",
+}
+_SECTOR_ETF_CACHE: dict = {}  # populated lazily, one fetch per ETF per run
+
+def fetch_sector_etf_return(sector: str) -> float:
+    """Day return % of the sector proxy ETF. Cached per run."""
+    etf = SECTOR_ETF_MAP.get(sector)
+    if not etf:
+        return 0.0
+    if etf in _SECTOR_ETF_CACHE:
+        return _SECTOR_ETF_CACHE[etf]
+    try:
+        raw = yf.download(etf, period="5d", interval="1d",
+                          auto_adjust=True, progress=False, timeout=15)
+        if raw is None or len(raw) < 2:
+            _SECTOR_ETF_CACHE[etf] = 0.0
+            return 0.0
+        df = raw.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        c = df["Close"].astype(float).values
+        ret = round(((c[-1] - c[-2]) / c[-2] * 100), 2) if c[-2] > 0 else 0.0
+        _SECTOR_ETF_CACHE[etf] = ret
+        return ret
+    except Exception:
+        _SECTOR_ETF_CACHE[etf] = 0.0
+        return 0.0
+
+
+# ── Futures roll-date awareness (Improvement 7) ───────────────────────────────
+FUTURES_QUARTERLY = {"ES=F", "NQ=F", "RTY=F", "YM=F", "ZN=F", "ZB=F", "6E=F", "6J=F", "VX=F"}
+FUTURES_MONTHLY   = {"CL=F", "NG=F", "GC=F", "SI=F", "HG=F", "PL=F", "PA=F", "BTC=F"}
+ROLL_WARNING_DAYS = 7   # warn when ≤ this many days to roll
+
+def _nth_friday(year: int, month: int, n: int) -> "datetime.date":
+    """Return the nth Friday (1-indexed) of the given month."""
+    cal     = monthcalendar(year, month)
+    fridays = [week[FRIDAY] for week in cal if week[FRIDAY] != 0]
+    return datetime(year, month, fridays[n - 1]).date()
+
+def _next_quarterly_expiry(from_date=None):
+    """3rd Friday of March, June, September, December — CME equity/financial futures."""
+    from_date = from_date or datetime.now(timezone.utc).date()
+    quarterly = {3, 6, 9, 12}
+    for offset in range(6):
+        raw_m = from_date.month + offset
+        yr    = from_date.year + (raw_m - 1) // 12
+        mo    = ((raw_m - 1) % 12) + 1
+        if mo in quarterly:
+            try:
+                exp = _nth_friday(yr, mo, 3)
+                if exp >= from_date:
+                    return exp
+            except IndexError:
+                continue
+    return None
+
+def _next_monthly_expiry(from_date=None):
+    """Last Friday of the month — approximation for commodity futures."""
+    from_date = from_date or datetime.now(timezone.utc).date()
+    for offset in range(3):
+        raw_m = from_date.month + offset
+        yr    = from_date.year + (raw_m - 1) // 12
+        mo    = ((raw_m - 1) % 12) + 1
+        try:
+            cal     = monthcalendar(yr, mo)
+            fridays = [week[FRIDAY] for week in cal if week[FRIDAY] != 0]
+            exp     = datetime(yr, mo, fridays[-1]).date()
+            if exp > from_date:
+                return exp
+        except Exception:
+            continue
+    return None
+
+def futures_roll_info(ticker: str) -> dict:
+    """Return roll-warning fields for a futures ticker."""
+    today = datetime.now(timezone.utc).date()
+    if ticker in FUTURES_QUARTERLY:
+        exp = _next_quarterly_expiry(today)
+    elif ticker in FUTURES_MONTHLY:
+        exp = _next_monthly_expiry(today)
+    else:
+        exp = None
+
+    if exp is None:
+        return {"futures_roll_warning": False, "days_to_roll": None, "roll_date": None}
+
+    days = (exp - today).days
+    return {
+        "futures_roll_warning": days <= ROLL_WARNING_DAYS,
+        "days_to_roll":         days,
+        "roll_date":            exp.isoformat(),
+    }
 
 # ── Global run stats ──────────────────────────────────────────────────────────
 _STATS = {
@@ -1129,12 +1238,19 @@ def scan_tier(tier_name: str, universe: list) -> list:
                 filtered += 1
                 continue
             logger.info(f"    {ticker}: CANDIDATE")
+            roll = futures_roll_info(ticker) if tier_name == "future" else {
+                "futures_roll_warning": False, "days_to_roll": None, "roll_date": None,
+            }
             candidates.append({
                 **m,
                 "tier":        tier_name,
                 "market":      "GLOBAL",
                 "net_yield":   net_yield(m["atr_pct"], market="us", tier=tier_name),
                 "rs_vs_bench": 0.0,
+                "rs_vs_sector":       None,
+                "short_interest_pct": None,
+                "earnings_surprise_avg": None,
+                **roll,
             })
 
     _STATS["universe_total"] += len(universe)
@@ -1211,6 +1327,12 @@ def scan_market(market_key: str) -> list:
                 "market":      market_key.upper(),
                 "net_yield":   net_yield(m["atr_pct"], market_key, tier="stock"),
                 "rs_vs_bench": round(m["day_return"] - bench_return, 2),
+                "rs_vs_sector":          None,
+                "short_interest_pct":    None,
+                "earnings_surprise_avg": None,
+                "futures_roll_warning":  False,
+                "days_to_roll":          None,
+                "roll_date":             None,
             })
 
     # Accumulate stats
@@ -1556,10 +1678,13 @@ def enrich_candidates(candidates: list) -> None:
     """
     Parallel yfinance enrichment for ALL candidates.
     Adds fields in-place:
-      earnings_soon  (bool)  — earnings within 5 days (stocks only)
-      sector         (str)   — yfinance sector/industry string
-      has_news_today (bool)  — any news item published in the last 24 h
-      news_headline  (str)   — title of the most recent news item (or "")
+      earnings_soon        (bool)  — earnings within 5 days (stocks only)
+      sector               (str)   — yfinance sector/industry string
+      has_news_today       (bool)  — any news item published in the last 24 h
+      news_headline        (str)   — title of the most recent news item (or "")
+      short_interest_pct   (float) — short interest as % of float (stocks, Improvement 9)
+      earnings_surprise_avg(float) — avg EPS surprise % last 4 quarters (stocks, Improvement 10)
+      rs_vs_sector         (float) — day_return minus sector ETF return (stocks, Improvement 5)
     """
     if not candidates:
         return
@@ -1571,7 +1696,7 @@ def enrich_candidates(candidates: list) -> None:
             tk   = yf.Ticker(ticker_str)
             info = tk.info
 
-            # ── Earnings flag (stocks only) ──────────────────────────────────
+            # ── Earnings flag + sector (stocks only) ─────────────────────────
             if is_stock:
                 ed = info.get("earningsDate") or info.get("earningsTimestamp")
                 if ed:
@@ -1584,15 +1709,57 @@ def enrich_candidates(candidates: list) -> None:
                 else:
                     c["earnings_soon"] = False
                 c["sector"] = info.get("sector") or info.get("industry") or "Other"
-            else:
-                c["earnings_soon"] = False
-                c["sector"] = c.get("tier", "other").upper()
 
-            # ── Improvement 1: News enrichment (all tiers) ──────────────────
+                # ── Improvement 9: Short interest ─────────────────────────────
+                si = info.get("shortPercentOfFloat")
+                c["short_interest_pct"] = round(float(si) * 100, 1) if si else None
+
+                # ── Improvement 10: Earnings surprise magnitude ───────────────
+                try:
+                    surprise = None
+                    # Attempt 1: earningsHistory key inside info
+                    eh = info.get("earningsHistory")
+                    if eh and isinstance(eh, dict):
+                        hist_list = eh.get("history", [])
+                        surps = [
+                            h.get("surprisePercent", 0) * 100
+                            for h in hist_list[-4:]
+                            if h.get("surprisePercent") is not None
+                        ]
+                        if surps:
+                            surprise = round(sum(surps) / len(surps), 1)
+                    # Attempt 2: quarterly_earnings DataFrame
+                    if surprise is None:
+                        q = tk.quarterly_earnings
+                        if q is not None and not q.empty:
+                            for act_col, est_col in [("Actual", "Estimate"), ("actual", "estimate")]:
+                                if act_col in q.columns and est_col in q.columns:
+                                    q2  = q[[act_col, est_col]].dropna()
+                                    est = q2[est_col].abs().replace(0, float("nan"))
+                                    surp = ((q2[act_col] - q2[est_col]) / est * 100).dropna()
+                                    if len(surp) > 0:
+                                        surprise = round(surp.head(4).mean(), 1)
+                                    break
+                    c["earnings_surprise_avg"] = surprise
+                except Exception:
+                    c["earnings_surprise_avg"] = None
+
+                # ── Improvement 5: RS vs sector ETF ──────────────────────────
+                sector_ret  = fetch_sector_etf_return(c["sector"])
+                c["rs_vs_sector"] = round(c.get("day_return", 0.0) - sector_ret, 2)
+
+            else:
+                c["earnings_soon"]        = False
+                c["sector"]               = c.get("tier", "other").upper()
+                c["short_interest_pct"]   = None
+                c["earnings_surprise_avg"]= None
+                c["rs_vs_sector"]         = None
+
+            # ── Improvement 1: News enrichment (all tiers) ───────────────────
             try:
                 import time as _time
                 news_items  = tk.news or []
-                cutoff_ts   = _time.time() - 86400          # last 24 hours
+                cutoff_ts   = _time.time() - 86400
                 today_news  = [
                     n for n in news_items
                     if n.get("providerPublishTime", 0) >= cutoff_ts
@@ -1604,12 +1771,15 @@ def enrich_candidates(candidates: list) -> None:
                 c["news_headline"]  = ""
 
         except Exception:
-            c["earnings_soon"]  = False
-            c["sector"]         = "Other" if is_stock else c.get("tier", "other").upper()
-            c["has_news_today"] = False
-            c["news_headline"]  = ""
+            c["earnings_soon"]        = False
+            c["sector"]               = "Other" if is_stock else c.get("tier", "other").upper()
+            c["has_news_today"]       = False
+            c["news_headline"]        = ""
+            c["short_interest_pct"]   = None
+            c["earnings_surprise_avg"]= None
+            c["rs_vs_sector"]         = None
 
-    logger.info(f"  Enriching {len(candidates)} candidates (earnings + sector + news)...")
+    logger.info(f"  Enriching {len(candidates)} candidates (earnings + sector + news + SI + surprise + sector RS)...")
     with ThreadPoolExecutor(max_workers=10) as ex:
         futs = [ex.submit(_fetch, c) for c in candidates]
         for f in as_completed(futs):
@@ -1637,39 +1807,49 @@ def deduplicate_by_sector(candidates: list, max_per_sector: int = 2) -> list:
 
 def classify_catalyst_tier(c: dict) -> str:
     """
-    Classify each candidate into A+, A, or B based on computed signals.
+    Classify each candidate into A+, A, or B.
 
-    A+ — highest conviction: earnings catalyst + gap + volume,
-         OR large surprise move, OR breaking news + big volume
-    A  — structural breakout / strong momentum, OR news catalyst today
-    B  — other qualifying setups (still valid, lower conviction)
+    A+ — earnings+gap+volume | large surprise move | news+volume | short squeeze setup
+    A  — structural breakout | strong momentum | news catalyst | strong earnings history
+    B  — all other qualifying setups
     """
-    has_earnings   = c.get("earnings_soon",  False)
-    has_news_today = c.get("has_news_today", False)
-    rvol           = c.get("rvol",       1.0)
-    move_pct       = abs(c.get("day_return", 0.0))
-    range_pos      = c.get("range_pos",  0.5)
-    ma_align       = c.get("ma_align",   "")
+    has_earnings        = c.get("earnings_soon",       False)
+    has_news_today      = c.get("has_news_today",      False)
+    rvol                = c.get("rvol",                1.0)
+    move_pct            = abs(c.get("day_return",      0.0))
+    range_pos           = c.get("range_pos",           0.5)
+    ma_align            = c.get("ma_align",            "")
+    si_pct              = c.get("short_interest_pct")         # float or None (Improvement 9)
+    earn_surp           = c.get("earnings_surprise_avg")      # float or None (Improvement 10)
 
-    # A+ = known earnings catalyst + significant gap + elevated volume
+    # A+ = earnings + significant gap + elevated volume
     if has_earnings and move_pct >= 2.0 and rvol >= 2.0:
         return "A+"
-    # A+ = large surprise move + very high RVOL (news-driven even without earnings flag)
+    # A+ = large surprise move + very high RVOL
     if move_pct >= 4.0 and rvol >= 3.0:
         return "A+"
-    # A+ = breaking news today + big move + volume surge (Improvement 1)
+    # A+ = breaking news + big move + volume surge
     if has_news_today and move_pct >= 2.0 and rvol >= 2.0:
         return "A+"
-    # A  = near 52-week high breakout with full trend alignment + volume
+    # A+ = short squeeze setup: high short interest + near 52w high breakout + volume (Improvement 9)
+    if si_pct and si_pct >= 15.0 and range_pos >= 0.85 and rvol >= 1.5:
+        return "A+"
+    # A+ = strong earnings beat history + upcoming earnings (Improvement 10)
+    if has_earnings and earn_surp is not None and earn_surp >= 10.0:
+        return "A+"
+    # A = near 52-week high breakout + full trend + volume
     if range_pos >= 0.85 and rvol >= 1.5 and ma_align == "MA↑":
         return "A"
-    # A  = strong directional move + volume + at least partial trend alignment
+    # A = strong directional move + volume + trend
     if move_pct >= 2.0 and rvol >= 2.0 and ma_align in ("MA↑", "MA→"):
         return "A"
-    # A  = news today + any elevated volume (news is a catalyst even if move < 2%) (Improvement 1)
+    # A = news today + elevated volume
     if has_news_today and rvol >= 1.5:
         return "A"
-    # B  = everything else that passed filters (valid, but lower conviction)
+    # A = consistent earnings beats (positive history even without imminent earnings) (Improvement 10)
+    if earn_surp is not None and earn_surp >= 10.0 and rvol >= 1.5:
+        return "A"
+    # B = everything else
     return "B"
 
 
