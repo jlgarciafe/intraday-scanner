@@ -47,6 +47,12 @@ TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 DRY_RUN             = os.getenv("DRY_RUN", "false").lower() == "true"
 
+# ── Position sizing ───────────────────────────────────────────────────────────
+# Capital and risk % are read from env so they can be adjusted without code changes.
+# Default: €250k capital, 2.5% risk per trade (middle of the 2-3% range).
+CAPITAL_EUR = float(os.getenv("CAPITAL_EUR", "250000"))
+RISK_PCT    = float(os.getenv("RISK_PCT",    "0.025"))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TECHNICAL INDICATORS
@@ -135,6 +141,36 @@ def find_support_resistance(df, current_price):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# POSITION SIZING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_position_sizing(entry_mid: float, stop_loss: float,
+                            capital: float = CAPITAL_EUR,
+                            risk_pct: float = RISK_PCT) -> dict:
+    """
+    Standard fixed-risk position sizing:
+        risk_eur      = capital × risk_pct
+        num_shares    = risk_eur / (entry - stop)
+        position_eur  = num_shares × entry
+
+    Returns a sizing dict, or None if stop_distance is invalid.
+    Works for both LONG (entry > stop) — SHORT handled by abs().
+    """
+    risk_eur      = capital * risk_pct
+    stop_distance = abs(entry_mid - stop_loss)
+    if stop_distance <= 0:
+        return None
+    num_shares   = risk_eur / stop_distance
+    position_eur = num_shares * entry_mid
+    return {
+        "risk_eur":      round(risk_eur),
+        "position_eur":  round(position_eur),
+        "num_shares":    int(round(num_shares)),
+        "risk_pct_used": round(risk_pct * 100, 1),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CORE TA ENTRY ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -153,6 +189,11 @@ def run_ta_entry(ticker, scanner_data=None):
         "week52_high": None, "week52_low": None,
         "atr": None, "supports": [], "resistances": [],
         "catalyst_note": None, "pass_reason": None,
+        # Position sizing (added — compute_position_sizing)
+        "position_size_eur": None, "risk_eur": None,
+        "num_shares": None, "risk_pct_used": None,
+        # Bias + catalyst tier inherited from scanner
+        "bias": "LONG", "catalyst_tier": "B",
     }
 
     try:
@@ -287,6 +328,18 @@ def run_ta_entry(ticker, scanner_data=None):
         result["recommended_exit"] = round(exit_price, 4)
         result["rr_exit"]          = rr_exit
 
+        # ── Position sizing ────────────────────────────────────────────────────
+        sizing = compute_position_sizing(entry_mid, stop_loss)
+        if sizing:
+            result["position_size_eur"] = sizing["position_eur"]
+            result["risk_eur"]          = sizing["risk_eur"]
+            result["num_shares"]        = sizing["num_shares"]
+            result["risk_pct_used"]     = sizing["risk_pct_used"]
+
+        # ── Inherit bias and catalyst tier from scanner output ─────────────────
+        result["bias"]          = scanner_data.get("bias", "LONG")
+        result["catalyst_tier"] = scanner_data.get("catalyst_tier", "B")
+
         at_support      = current_price <= nearest_support * 1.02
         near_resistance = bool(resistances and current_price >= resistances[0] * 0.97)
         at_52w_low      = current_price <= result["week52_low"] * 1.05
@@ -357,13 +410,17 @@ def format_best_opportunities_summary(top10: list, total_actionable: int, total_
 
     trend_tag   = lambda t: "MA↑" if t == "UPTREND" else ("MA→" if t == "MIXED" else "MA↓")
     verdict_tag = lambda v: "✅ ENTER" if v.startswith("ENTER") else ("⏳ DIP" if v.startswith("WAIT FOR DIP") else "⏳ BRKOUT")
+    ct_tag      = lambda c: {"A+": "🔥A+", "A": "🔵A", "B": "🟡B"}.get(c, "🟡B")
+    bias_tag    = lambda b: "📉S" if b == "SHORT" else "📈L"
     for i, r in enumerate(top10, 1):
         sym    = r.get("ticker", "?")
         name   = _short(r.get("name", sym))
         trend  = trend_tag(r.get("trend_primary", ""))
         rsi    = r.get("rsi", "-")
         tag    = verdict_tag(r.get("verdict", ""))
-        lines.append(f"{i}. *{sym}* ({name}) | {trend} | RSI {rsi} | {tag}")
+        ct     = ct_tag(r.get("catalyst_tier", "B"))
+        bias   = bias_tag(r.get("bias", "LONG"))
+        lines.append(f"{i}. {ct} *{sym}* ({name}) | {bias} | {trend} | RSI {rsi} | {tag}")
     lines += ["", "_Detail cards follow_ ↓"]
     return "\n".join(lines)
 
@@ -393,9 +450,26 @@ def format_telegram_card(r, rank):
     else:
         tag = f"⏳ WAIT — BREAKOUT  ({verdict})"
 
-    trend_tag = {"UPTREND": "MA↑", "MIXED": "MA→", "DOWNTREND": "MA↓"}.get(r.get("trend_primary", ""), "MA→")
+    trend_tag   = {"UPTREND": "MA↑", "MIXED": "MA→", "DOWNTREND": "MA↓"}.get(r.get("trend_primary", ""), "MA→")
+
+    # Catalyst tier + bias from scanner
+    ct          = r.get("catalyst_tier", "B")
+    ct_label    = {"A+": "🔥A+", "A": "🔵A", "B": "🟡B"}.get(ct, "🟡B")
+    bias        = r.get("bias", "LONG")
+    bias_label  = "📉 SHORT" if bias == "SHORT" else "📈 LONG"
+
+    # Position sizing line
+    pos_eur  = r.get("position_size_eur")
+    risk_eur = r.get("risk_eur")
+    n_shares = r.get("num_shares")
+    risk_pct = r.get("risk_pct_used", RISK_PCT * 100)
+    if pos_eur:
+        sizing_line = f"Size:     €{pos_eur:,.0f}  ({n_shares:,} units)  Risk: €{risk_eur:,.0f} ({risk_pct}%)"
+    else:
+        sizing_line = "Size:     —"
+
     return "\n".join([
-        f"*#{rank} {sym}* ({name})",
+        f"*#{rank} {ct_label} {sym}* ({name}) — {bias_label}",
         f"{ccy} {price:.2f} | {trend_tag} | RSI {r.get('rsi', '-')}",
         f"",
         f"Entry:    {ccy} {entry}",
@@ -404,6 +478,7 @@ def format_telegram_card(r, rank):
         f"T2:       {ccy} {t2}",
         f"Exit:     {ccy} {ex}",
         f"",
+        f"{sizing_line}",
         f"Momentum: {momentum}",
         f"Catalyst: {catalyst}",
         f"{tag}",

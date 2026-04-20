@@ -955,6 +955,8 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
         rsi        = compute_rsi(c)
         day_return = ((c[-1]-c[-2])/c[-2]*100) if len(c)>=2 and c[-2]>0 else 0.0
         day_range  = ((h[-1]-l[-1])/l[-1]*100) if l[-1]>0 else 0.0
+        # LONG if price moved up today, SHORT if moved down — bias for trade direction
+        bias       = "LONG" if day_return > 0 else ("SHORT" if day_return < 0 else "NEUTRAL")
 
         # ── 52-week range position (Point 5) ──────────────────────────────────
         w52_h     = float(h[-252:].max()) if len(h) >= 252 else float(h.max())
@@ -997,6 +999,7 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
             "score": round(score,1),
             "week52_high": round(w52_h,4), "week52_low": round(w52_l,4),
             "range_pos": range_pos, "ma_align": ma_align,
+            "bias": bias,
         }
     except Exception as e:
         logger.info(f"    {ticker}: analysis error — {e}")
@@ -1361,20 +1364,25 @@ def format_telegram(candidates: list) -> str:
         )
 
     def fmt(c: dict, i: int) -> str:
-        e        = "🟢" if c["day_return"] > 0 else "🔴"
-        label    = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
-        rpt      = c.get("repeat_days", 0)
-        trend    = c.get("score_trend", "")
-        flag     = f" 🔁{rpt}d{trend}" if rpt >= 3 else ""
-        earn     = " ⚠️EARN" if c.get("earnings_soon") else ""
-        name     = get_ticker_name(c["ticker"])
-        name_str = f" <i>({name})</i>" if name else ""
-        rs       = c.get("rs_vs_bench")
-        rs_str   = f" RS{rs:+.1f}%" if rs is not None and c.get("tier") == "stock" else ""
-        ma       = c.get("ma_align", "")
-        ma_str   = f" {ma}" if ma else ""
+        e         = "🟢" if c["day_return"] > 0 else "🔴"
+        label     = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
+        rpt       = c.get("repeat_days", 0)
+        trend     = c.get("score_trend", "")
+        flag      = f" 🔁{rpt}d{trend}" if rpt >= 3 else ""
+        earn      = " ⚠️EARN" if c.get("earnings_soon") else ""
+        name      = get_ticker_name(c["ticker"])
+        name_str  = f" <i>({name})</i>" if name else ""
+        rs        = c.get("rs_vs_bench")
+        rs_str    = f" RS{rs:+.1f}%" if rs is not None and c.get("tier") == "stock" else ""
+        ma        = c.get("ma_align", "")
+        ma_str    = f" {ma}" if ma else ""
+        # Catalyst tier badge (A+/A/B) — additive signal
+        ct        = c.get("catalyst_tier", "B")
+        ct_badge  = {"A+": "🔥<b>A+</b>", "A": "🔵<b>A</b>", "B": "🟡B"}.get(ct, "🟡B")
+        # SHORT flag — explicit when bias is SHORT so user knows direction
+        short_tag = " 📉<b>SHORT</b>" if c.get("bias") == "SHORT" else ""
         return (
-            f"{i}. [{label}] <b>{c['ticker']}</b>{name_str}{flag}{earn} "
+            f"{i}. {ct_badge}[{label}] <b>{c['ticker']}</b>{name_str}{flag}{earn}{short_tag} "
             f"{e}{c['day_return']:+.1f}%{rs_str}{ma_str} | "
             f"ATR {c['atr_pct']:.1f}% | RVOL {c['rvol']:.1f}x | Score <b>{c['score']:.0f}</b>"
         )
@@ -1584,6 +1592,37 @@ def deduplicate_by_sector(candidates: list, max_per_sector: int = 2) -> list:
     return sorted(result, key=lambda x: x["score"], reverse=True)
 
 
+def classify_catalyst_tier(c: dict) -> str:
+    """
+    Classify each candidate into A+, A, or B based on existing computed signals.
+    No new data sources required — uses fields already in the candidate dict.
+
+    A+ — highest conviction: earnings catalyst + gap + volume, OR large surprise move
+    A  — structural breakout or strong directional momentum with volume confirmation
+    B  — other qualifying setups (still valid, lower conviction)
+    """
+    has_earnings = c.get("earnings_soon", False)
+    rvol         = c.get("rvol", 1.0)
+    move_pct     = abs(c.get("day_return", 0.0))
+    range_pos    = c.get("range_pos", 0.5)
+    ma_align     = c.get("ma_align", "")
+
+    # A+ = known earnings catalyst + significant gap + elevated volume
+    if has_earnings and move_pct >= 2.0 and rvol >= 2.0:
+        return "A+"
+    # A+ = large surprise move + very high RVOL (news-driven even without earnings flag)
+    if move_pct >= 4.0 and rvol >= 3.0:
+        return "A+"
+    # A  = near 52-week high breakout with full trend alignment + volume
+    if range_pos >= 0.85 and rvol >= 1.5 and ma_align == "MA↑":
+        return "A"
+    # A  = strong directional move + volume + at least partial trend alignment
+    if move_pct >= 2.0 and rvol >= 2.0 and ma_align in ("MA↑", "MA→"):
+        return "A"
+    # B  = everything else that passed filters (valid, but lower conviction)
+    return "B"
+
+
 def main():
     logger.info("=" * 60)
     logger.info("INTRADAY MOMENTUM SCANNER v6 — Dynamic Universe + ETF/Futures Tiers + 11 Markets")
@@ -1614,6 +1653,18 @@ def main():
             f"Trend candidates (>=3 days): "
             + ", ".join(f"{c['ticker']}({c['repeat_days']}d{c['score_trend']})" for c in repeaters)
         )
+
+    # ── Catalyst tier classification (A+/A/B) — additive, uses existing signals ─
+    for c in candidates:
+        c["catalyst_tier"] = classify_catalyst_tier(c)
+    tier_counts = {}
+    for c in candidates:
+        t = c["catalyst_tier"]
+        tier_counts[t] = tier_counts.get(t, 0) + 1
+    logger.info(
+        f"Catalyst tiers: A+={tier_counts.get('A+',0)} | "
+        f"A={tier_counts.get('A',0)} | B={tier_counts.get('B',0)}"
+    )
 
     save_scan_history(history, candidates)
 
