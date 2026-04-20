@@ -184,28 +184,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM:         ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
         run: |
-          python ta_runner.py --from-file scan_results.json --skip-email
-
-      - name: Generate TA narrative (Claude API)
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          python ta_narrative.py \
-            --orders orders.json \
-            --out-ratings ta_ratings.json \
-            --out-narrative ta_narrative.md
-
-      - name: Send combined email report
-        env:
-          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
-          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        run: |
-          python send_report.py \
-            --orders orders.json \
-            --ratings ta_ratings.json \
-            --narrative ta_narrative.md
+          python ta_runner.py --from-file scan_results.json
 
       - name: Upload TA results artifact
         if: always()
@@ -214,8 +197,6 @@ jobs:
           name: ta-entry-${{ github.run_number }}
           path: |
             orders.json
-            ta_ratings.json
             ta_report.md
-            ta_narrative.md
             scan_report_*.xlsx
           retention-days: 14

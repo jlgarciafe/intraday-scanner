@@ -21,6 +21,7 @@ Usage:
 """
 
 import os
+import re
 import json
 import argparse
 import math
@@ -949,14 +950,205 @@ def generate_excel_report(all_candidates: list, top10: list,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMAIL REPORT
+# EMAIL REPORT  (HTML)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def send_email_report(filepath: str, subject_suffix: str = "") -> bool:
+_CCY_SYM = {
+    "USD": "$",  "EUR": "€",  "GBP": "£",  "JPY": "¥",  "KRW": "₩",
+    "HKD": "HK$","NOK": "NOK ","CAD": "C$","AUD": "A$", "SEK": "SEK ",
+    "DKK": "DKK ","CHF": "CHF ","INR": "₹","SGD": "S$",
+}
+
+def _fp(val) -> str:
+    """Format price for email table."""
+    if val is None:
+        return "—"
+    try:
+        v = float(val)
+        if v >= 100000: return f"{v:,.0f}"
+        if v >= 10000:  return f"{v:,.0f}"
+        if v >= 100:    return f"{v:,.1f}"
+        return f"{v:,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+def _sv(v: str) -> str:
+    """Shorten verdict to table label."""
+    if not v: return "—"
+    if v.startswith("ENTER SHORT"): return "Short Now"
+    if v.startswith("ENTER"):       return "Enter Now"
+    m = re.search(r"DIP TO ([\d,.]+)", v)
+    if m: return f"Dip {m.group(1).replace(',','').rstrip('0').rstrip('.')}"
+    m = re.search(r"BREAKDOWN BELOW ([\d,.]+)", v)
+    if m: return f"BrkDwn {m.group(1).replace(',','')}"
+    m = re.search(r"BREAKOUT ABOVE ([\d,.]+)", v)
+    if m: return f"Brkout {m.group(1).replace(',','')}"
+    if "PASS" in v.upper(): return "Pass"
+    return v[:12]
+
+def build_html_email(top10: list, run_time: str) -> str:
+    """Build complete HTML email body from top10 TA results."""
+
+    NAVY   = "#1F3864"
+    LGRAY  = "#F5F5F5"
+    DGRAY  = "#D0D0D0"
+
+    TH = (
+        'style="background:#1F3864;color:#FFFFFF;font-weight:bold;'
+        'padding:8px 10px;text-align:center;border:1px solid #3A5080;'
+        'white-space:nowrap;font-size:11px;"'
+    )
+
+    def td(content, bg, extra="", align="center"):
+        return (
+            f'<td style="padding:7px 9px;border:1px solid #CCCCCC;background:{bg};'
+            f'text-align:{align};vertical-align:middle;font-size:12px;'
+            f'font-family:Arial,sans-serif;{extra}">{content}</td>'
+        )
+
+    def tier_badge(ct):
+        cfg = {
+            "A+": ("#C55A11", "#FFFFFF", "🔥 A+"),
+            "A":  ("#2E75B6", "#FFFFFF", "🔵 A"),
+            "B":  ("#FFC000", "#7F6000", "🟡 B"),
+        }.get(ct, ("#FFC000", "#7F6000", "🟡 B"))
+        return (
+            f'<span style="background:{cfg[0]};color:{cfg[1]};font-weight:bold;'
+            f'padding:2px 8px;border-radius:4px;font-size:11px;white-space:nowrap;">'
+            f'{cfg[2]}</span>'
+        )
+
+    def bias_html(bias):
+        if bias == "SHORT":
+            return '<span style="color:#C00000;font-weight:bold;">📉 SHORT</span>'
+        return '<span style="color:#00B050;font-weight:bold;">📈 LONG</span>'
+
+    def momentum_html(mom, bias):
+        # For SHORT: bearish is good; for LONG: bullish is good
+        if bias == "SHORT":
+            if mom == "BEARISH": return '✅ BEARISH'
+            if mom == "BULLISH": return '⚠️ BULLISH'
+        else:
+            if mom == "BULLISH": return '✅ BULLISH'
+            if mom == "BEARISH": return '⚠️ BEARISH'
+        return '— NEUTRAL'
+
+    trend_map = {"UPTREND": "MA↑", "DOWNTREND": "MA↓", "MIXED": "MA→"}
+
+    cols = ["#", "TICKER", "TIER", "BIAS", "NOW", "ENTRY",
+            "STOP", "T1", "T2", "EXIT", "R/R",
+            "MOMENTUM", "TREND", "CATALYST", "VERDICT"]
+    header = "".join(f"<th {TH}>{c}</th>" for c in cols)
+
+    rows = []
+    for i, r in enumerate(top10):
+        bias    = r.get("bias", "LONG")
+        verdict = r.get("verdict", "")
+        bg      = "#EAF5EA" if verdict.startswith("ENTER") else ("#FFF8E1" if "WAIT" in verdict else ("#F5F5F5" if i % 2 == 0 else "#FFFFFF"))
+
+        ccy = r.get("currency", "USD")
+        sym = _CCY_SYM.get(ccy, f"{ccy} ")
+
+        name      = r.get("name", r.get("ticker", ""))
+        ticker    = r.get("ticker", "")
+        name_disp = (name[:20] + "…") if len(name) > 22 else name
+        ticker_cell = (
+            f'<strong style="font-size:13px;">{ticker}</strong>'
+            f'<br><span style="font-size:10px;color:#666666;">{name_disp}</span>'
+        )
+
+        price  = f"{sym}{_fp(r.get('current_price'))}"
+        entry  = f"{_fp(r.get('entry_low'))}–{_fp(r.get('entry_high'))}"
+        stop   = _fp(r.get("stop_loss"))
+        t1     = _fp(r.get("target_1"))
+        t2     = _fp(r.get("target_2"))
+        ex     = _fp(r.get("recommended_exit"))
+        rr_val = r.get("rr_exit")
+        rr     = f"{rr_val:.1f}×" if rr_val else "—"
+        cat    = r.get("catalyst_note") or "None"
+        mom    = r.get("momentum_st", "NEUTRAL")
+        trend  = trend_map.get(r.get("trend_primary", ""), "MA→")
+        ct     = r.get("catalyst_tier", "B")
+
+        rows.append(
+            "<tr>"
+            + td(str(i + 1),           bg)
+            + td(ticker_cell,          bg, align="left")
+            + td(tier_badge(ct),       bg)
+            + td(bias_html(bias),      bg)
+            + td(price,                bg, "font-weight:bold;")
+            + td(entry,                bg)
+            + td(stop,                 bg)
+            + td(t1,                   bg)
+            + td(t2,                   bg)
+            + td(ex,                   bg)
+            + td(rr,                   bg, "font-weight:bold;")
+            + td(momentum_html(mom, bias), bg, "font-size:11px;")
+            + td(trend,                bg, "font-size:14px;font-weight:bold;")
+            + td(cat,                  bg, "font-size:11px;")
+            + td(_sv(verdict),         bg, "font-size:11px;font-weight:bold;")
+            + "</tr>"
+        )
+
+    table = (
+        f'<table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;">'
+        f"<thead><tr>{header}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        f"</table>"
+    )
+
+    legend = f"""
+<table style="border-collapse:collapse;width:100%;font-size:12px;font-family:Arial,sans-serif;margin-top:8px;">
+  <tr><td colspan="2" style="background:#E8F5E9;padding:7px 10px;border:1px solid #CCCCCC;font-weight:bold;">
+    📊 Excel attached — 3 sheets
+  </td></tr>
+  <tr><td style="padding:6px 10px;border:1px solid #DDDDDD;background:{LGRAY};width:36%;"><strong>Sheet 1 — TOP MOVERS</strong></td>
+      <td style="padding:6px 10px;border:1px solid #DDDDDD;background:{LGRAY};">All qualifying candidates ranked by scanner score</td></tr>
+  <tr><td style="padding:6px 10px;border:1px solid #DDDDDD;"><strong>Sheet 2 — TOP OPPORTUNITIES</strong></td>
+      <td style="padding:6px 10px;border:1px solid #DDDDDD;">Top 10 ranked by entry quality (A+ first)</td></tr>
+  <tr><td style="padding:6px 10px;border:1px solid #DDDDDD;background:{LGRAY};"><strong>Sheet 3 — DETAIL CARDS</strong></td>
+      <td style="padding:6px 10px;border:1px solid #DDDDDD;background:{LGRAY};">Full TA: entry zone / stop / T1 / T2 / exit / sizing</td></tr>
+</table>
+<p style="font-family:Arial,sans-serif;font-size:11px;color:#888888;margin-top:10px;">
+  Tier: 🔥 A+ highest conviction &nbsp;|&nbsp; 🔵 A strong &nbsp;|&nbsp; 🟡 B standard<br>
+  Direction: 📈 LONG &nbsp;|&nbsp; 📉 SHORT<br><br>
+  ⚠️ <em>Research only. Not financial advice.</em>
+</p>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#EFEFEF;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:{NAVY};padding:18px 32px;">
+    <tr><td>
+      <div style="color:#FFFFFF;font-size:20px;font-weight:bold;">📡 Intraday Scanner</div>
+      <div style="color:#A8BFDA;font-size:12px;margin-top:3px;">{run_time}</div>
+    </td></tr>
+  </table>
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:1050px;margin:20px auto;">
+    <tr><td style="background:#FFFFFF;padding:24px 28px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.10);">
+      <h3 style="font-family:Arial,sans-serif;font-size:13px;font-weight:bold;color:{NAVY};
+                 margin:0 0 12px 0;border-bottom:1px solid {DGRAY};padding-bottom:4px;">
+        Top Opportunities — Ranked by Entry Quality &amp; Conviction Tier
+      </h3>
+      {table}
+      <hr style="border:none;border-top:1px solid {DGRAY};margin:22px 0;">
+      {legend}
+    </td></tr>
+  </table>
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:1050px;margin:0 auto 28px;">
+    <tr><td style="text-align:center;font-size:10px;color:#AAAAAA;padding:8px;">
+      JLG Hunt Bot &nbsp;·&nbsp; intraday-scanner &nbsp;·&nbsp; {run_time}
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+
+def send_email_report(top10: list, filepath: str, run_time: str) -> bool:
     """
-    Email the Excel report as an attachment via SMTP.
+    Send HTML email with the opportunity table + Excel attachment.
     Required env vars: EMAIL_TO, EMAIL_FROM, EMAIL_PASSWORD
-    Optional:          SMTP_HOST (default smtp.gmail.com), SMTP_PORT (default 587)
     """
     import smtplib
     from email.mime.multipart import MIMEMultipart
@@ -974,22 +1166,16 @@ def send_email_report(filepath: str, subject_suffix: str = "") -> bool:
         print("WARN: EMAIL_TO / EMAIL_FROM / EMAIL_PASSWORD not set — skipping email")
         return False
 
-    msg            = MIMEMultipart()
+    html_body = build_html_email(top10, run_time)
+
+    msg            = MIMEMultipart("mixed")
     msg["From"]    = email_from
     msg["To"]      = email_to
-    msg["Subject"] = f"Intraday Scanner Report — {subject_suffix}"
+    msg["Subject"] = f"Intraday Scanner — {run_time}"
 
-    body = (
-        f"Intraday Scanner — {subject_suffix}\n\n"
-        f"Excel report attached (3 sheets):\n"
-        f"  1. TOP MOVERS         — all qualifying candidates ranked by score\n"
-        f"  2. TOP OPPORTUNITIES  — top 10 ranked by entry quality (A+ first)\n"
-        f"  3. DETAIL CARDS       — full TA: entry zone / stop / T1 / T2 / exit / sizing\n\n"
-        f"Tier legend:  🔥 A+ = highest conviction  |  🔵 A = strong  |  🟡 B = standard\n"
-        f"Direction:    LONG = buy & hold up  |  SHORT = sell & profit on fall\n\n"
-        f"⚠️  Research only. Not financial advice.\n"
-    )
-    msg.attach(MIMEText(body, "plain"))
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt)
 
     with open(filepath, "rb") as fh:
         part = MIMEBase("application", "octet-stream")
@@ -1006,7 +1192,7 @@ def send_email_report(filepath: str, subject_suffix: str = "") -> bool:
         srv.login(email_from, email_pass)
         srv.sendmail(email_from, email_to, msg.as_string())
         srv.quit()
-        print(f"Email report sent → {email_to}")
+        print(f"HTML email sent → {email_to}")
         return True
     except Exception as e:
         print(f"ERROR sending email: {e}")
@@ -1022,8 +1208,6 @@ def main():
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--tickers",   nargs="+", help="Space-separated tickers")
     group.add_argument("--from-file", help="Path to scan_results.json")
-    parser.add_argument("--skip-email", action="store_true",
-                        help="Skip email sending (used when send_report.py handles it)")
     args = parser.parse_args()
 
     if args.tickers:
@@ -1137,20 +1321,17 @@ def main():
             f"0 actionable setups from {len(tickers)} scanned."
         )
 
-    # ── Excel report (always generated — needed as artifact + for send_report.py) ─
+    # ── Excel report + HTML email ─────────────────────────────────────────────
     xl_path        = f"scan_report_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.xlsx"
     all_candidates = list(scanner_data.values()) if scanner_data else []
     try:
         generate_excel_report(all_candidates, top10, filepath=xl_path)
         print(f"Excel report written: {xl_path}")
-        if args.skip_email:
-            print("Email deferred (--skip-email) — send_report.py will handle it")
-        else:
-            send_email_report(xl_path, subject_suffix=now_str)
+        send_email_report(top10, xl_path, now_str)
     except ImportError:
         print("WARN: openpyxl not installed — skipping Excel report")
     except Exception as e:
-        print(f"ERROR generating Excel report: {e}")
+        print(f"ERROR generating Excel/email report: {e}")
 
     print(f"\n{'='*60}")
     print(f"Done. {len(actionable)}/{len(tickers)} actionable. Top {len(top10)} sent to Telegram.")
