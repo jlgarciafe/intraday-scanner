@@ -955,8 +955,6 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
         rsi        = compute_rsi(c)
         day_return = ((c[-1]-c[-2])/c[-2]*100) if len(c)>=2 and c[-2]>0 else 0.0
         day_range  = ((h[-1]-l[-1])/l[-1]*100) if l[-1]>0 else 0.0
-        # LONG if price moved up today, SHORT if moved down — bias for trade direction
-        bias       = "LONG" if day_return > 0 else ("SHORT" if day_return < 0 else "NEUTRAL")
 
         # ── 52-week range position (Point 5) ──────────────────────────────────
         w52_h     = float(h[-252:].max()) if len(h) >= 252 else float(h.max())
@@ -976,6 +974,31 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
             ma_bonus = 5;  ma_align = "MA→"
         else:
             ma_bonus = 0;  ma_align = "MA↓"
+
+        # ── Improvement 2: Structural SHORT qualification ──────────────────────
+        # A ticker only gets SHORT bias when ALL four conditions hold:
+        # (1) confirmed downtrend: price < MA50 < MA200
+        # (2) elevated sell-side volume: RVOL ≥ 1.5×
+        # (3) bearish momentum: RSI < 50
+        # (4) price below 20-day MA (no near-term support bounce)
+        # Everything else defaults to LONG (follow the primary trend).
+        if day_return >= 0:
+            bias = "LONG"
+        elif (c[-1] < ma50) and (ma50 < ma200) and (rvol >= 1.5) and (rsi < 50) and (c[-1] < ma20):
+            bias = "SHORT"
+        else:
+            bias = "LONG"
+
+        # ── Improvement 4: Weekly trend confirmation ───────────────────────────
+        # Sample every 5 daily closes → synthetic weekly series → 20-week MA.
+        # weekly_trend_up = True means price is above its 20-week moving average.
+        weekly_closes = c[::5]
+        if len(weekly_closes) >= 20:
+            wma20 = float(pd.Series(weekly_closes).rolling(20).mean().iloc[-1])
+            weekly_trend_up = bool(c[-1] > wma20)
+        else:
+            # Not enough history — fall back to 50-day MA as proxy
+            weekly_trend_up = bool(c[-1] > ma50)
 
         score = (
             min(atr_pct/5.0, 1.0)*30 +
@@ -1000,6 +1023,7 @@ def analyse_ticker(ticker: str, df: pd.DataFrame) -> dict:
             "week52_high": round(w52_h,4), "week52_low": round(w52_l,4),
             "range_pos": range_pos, "ma_align": ma_align,
             "bias": bias,
+            "weekly_trend_up": weekly_trend_up,
         }
     except Exception as e:
         logger.info(f"    {ticker}: analysis error — {e}")
@@ -1530,47 +1554,66 @@ def compute_persistence(ticker: str, history: dict) -> dict:
 
 def enrich_candidates(candidates: list) -> None:
     """
-    Parallel yfinance enrichment for stock candidates only.
-    Adds two fields in-place:
-      earnings_soon (bool)  — earnings within 5 days
-      sector        (str)   — yfinance sector/industry string
+    Parallel yfinance enrichment for ALL candidates.
+    Adds fields in-place:
+      earnings_soon  (bool)  — earnings within 5 days (stocks only)
+      sector         (str)   — yfinance sector/industry string
+      has_news_today (bool)  — any news item published in the last 24 h
+      news_headline  (str)   — title of the most recent news item (or "")
     """
-    stock_cands = [c for c in candidates if c.get("tier") == "stock"]
-    if not stock_cands:
+    if not candidates:
         return
 
     def _fetch(c):
+        ticker_str = c["ticker"]
+        is_stock   = c.get("tier") == "stock"
         try:
-            info = yf.Ticker(c["ticker"]).info
-            # Earnings flag
-            ed = info.get("earningsDate") or info.get("earningsTimestamp")
-            if ed:
-                if isinstance(ed, (int, float)):
-                    from datetime import date
-                    ed_date = datetime.fromtimestamp(ed).date()
+            tk   = yf.Ticker(ticker_str)
+            info = tk.info
+
+            # ── Earnings flag (stocks only) ──────────────────────────────────
+            if is_stock:
+                ed = info.get("earningsDate") or info.get("earningsTimestamp")
+                if ed:
+                    if isinstance(ed, (int, float)):
+                        ed_date = datetime.fromtimestamp(ed).date()
+                    else:
+                        ed_date = datetime.strptime(str(ed)[:10], "%Y-%m-%d").date()
+                    days_to = (ed_date - datetime.now(timezone.utc).date()).days
+                    c["earnings_soon"] = 0 <= days_to <= 5
                 else:
-                    ed_date = datetime.strptime(str(ed)[:10], "%Y-%m-%d").date()
-                days_to = (ed_date - datetime.now(timezone.utc).date()).days
-                c["earnings_soon"] = 0 <= days_to <= 5
+                    c["earnings_soon"] = False
+                c["sector"] = info.get("sector") or info.get("industry") or "Other"
             else:
                 c["earnings_soon"] = False
-            # Sector
-            c["sector"] = info.get("sector") or info.get("industry") or "Other"
-        except Exception:
-            c["earnings_soon"] = False
-            c["sector"]        = "Other"
+                c["sector"] = c.get("tier", "other").upper()
 
-    logger.info(f"  Enriching {len(stock_cands)} stock candidates (earnings + sector)...")
+            # ── Improvement 1: News enrichment (all tiers) ──────────────────
+            try:
+                import time as _time
+                news_items  = tk.news or []
+                cutoff_ts   = _time.time() - 86400          # last 24 hours
+                today_news  = [
+                    n for n in news_items
+                    if n.get("providerPublishTime", 0) >= cutoff_ts
+                ]
+                c["has_news_today"] = bool(today_news)
+                c["news_headline"]  = today_news[0].get("title", "") if today_news else ""
+            except Exception:
+                c["has_news_today"] = False
+                c["news_headline"]  = ""
+
+        except Exception:
+            c["earnings_soon"]  = False
+            c["sector"]         = "Other" if is_stock else c.get("tier", "other").upper()
+            c["has_news_today"] = False
+            c["news_headline"]  = ""
+
+    logger.info(f"  Enriching {len(candidates)} candidates (earnings + sector + news)...")
     with ThreadPoolExecutor(max_workers=10) as ex:
-        futs = [ex.submit(_fetch, c) for c in stock_cands]
+        futs = [ex.submit(_fetch, c) for c in candidates]
         for f in as_completed(futs):
             f.result()
-
-    # ETF/Futures don't have traditional earnings — set defaults
-    for c in candidates:
-        if c.get("tier") != "stock":
-            c.setdefault("earnings_soon", False)
-            c.setdefault("sector", c.get("tier", "other").upper())
 
 
 def deduplicate_by_sector(candidates: list, max_per_sector: int = 2) -> list:
@@ -1594,18 +1637,19 @@ def deduplicate_by_sector(candidates: list, max_per_sector: int = 2) -> list:
 
 def classify_catalyst_tier(c: dict) -> str:
     """
-    Classify each candidate into A+, A, or B based on existing computed signals.
-    No new data sources required — uses fields already in the candidate dict.
+    Classify each candidate into A+, A, or B based on computed signals.
 
-    A+ — highest conviction: earnings catalyst + gap + volume, OR large surprise move
-    A  — structural breakout or strong directional momentum with volume confirmation
+    A+ — highest conviction: earnings catalyst + gap + volume,
+         OR large surprise move, OR breaking news + big volume
+    A  — structural breakout / strong momentum, OR news catalyst today
     B  — other qualifying setups (still valid, lower conviction)
     """
-    has_earnings = c.get("earnings_soon", False)
-    rvol         = c.get("rvol", 1.0)
-    move_pct     = abs(c.get("day_return", 0.0))
-    range_pos    = c.get("range_pos", 0.5)
-    ma_align     = c.get("ma_align", "")
+    has_earnings   = c.get("earnings_soon",  False)
+    has_news_today = c.get("has_news_today", False)
+    rvol           = c.get("rvol",       1.0)
+    move_pct       = abs(c.get("day_return", 0.0))
+    range_pos      = c.get("range_pos",  0.5)
+    ma_align       = c.get("ma_align",   "")
 
     # A+ = known earnings catalyst + significant gap + elevated volume
     if has_earnings and move_pct >= 2.0 and rvol >= 2.0:
@@ -1613,11 +1657,17 @@ def classify_catalyst_tier(c: dict) -> str:
     # A+ = large surprise move + very high RVOL (news-driven even without earnings flag)
     if move_pct >= 4.0 and rvol >= 3.0:
         return "A+"
+    # A+ = breaking news today + big move + volume surge (Improvement 1)
+    if has_news_today and move_pct >= 2.0 and rvol >= 2.0:
+        return "A+"
     # A  = near 52-week high breakout with full trend alignment + volume
     if range_pos >= 0.85 and rvol >= 1.5 and ma_align == "MA↑":
         return "A"
     # A  = strong directional move + volume + at least partial trend alignment
     if move_pct >= 2.0 and rvol >= 2.0 and ma_align in ("MA↑", "MA→"):
+        return "A"
+    # A  = news today + any elevated volume (news is a catalyst even if move < 2%) (Improvement 1)
+    if has_news_today and rvol >= 1.5:
         return "A"
     # B  = everything else that passed filters (valid, but lower conviction)
     return "B"

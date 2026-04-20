@@ -236,15 +236,21 @@ def run_ta_entry(ticker, scanner_data=None):
         "bias": "LONG", "catalyst_tier": "B",
         # Scanner context carried forward for display
         "rs_vs_bench": None, "day_return": None, "rvol": None,
+        # Improvement 1 + 4: news and weekly trend from scanner
+        "has_news_today": False, "news_headline": "",
+        "weekly_trend_up": None,
     }
 
     # ── Inherit scanner context early — bias is needed before level calculations
     if scanner_data:
-        result["bias"]          = scanner_data.get("bias", "LONG")
-        result["catalyst_tier"] = scanner_data.get("catalyst_tier", "B")
-        result["rs_vs_bench"]   = scanner_data.get("rs_vs_bench")
-        result["day_return"]    = scanner_data.get("day_return")
-        result["rvol"]          = scanner_data.get("rvol")
+        result["bias"]            = scanner_data.get("bias", "LONG")
+        result["catalyst_tier"]   = scanner_data.get("catalyst_tier", "B")
+        result["rs_vs_bench"]     = scanner_data.get("rs_vs_bench")
+        result["day_return"]      = scanner_data.get("day_return")
+        result["rvol"]            = scanner_data.get("rvol")
+        result["has_news_today"]  = scanner_data.get("has_news_today", False)
+        result["news_headline"]   = scanner_data.get("news_headline", "")
+        result["weekly_trend_up"] = scanner_data.get("weekly_trend_up")
     bias = result["bias"]
 
     try:
@@ -646,6 +652,24 @@ def format_telegram_card(r, rank):
     bias_label = "📉 SHORT" if bias == "SHORT" else "📈 LONG"
     catalyst   = r.get("catalyst_note") or "No near-term catalyst"
 
+    # ── Improvement 1: News headline ──────────────────────────────────────────
+    has_news     = r.get("has_news_today", False)
+    news_headline = r.get("news_headline", "")
+    if has_news and news_headline:
+        short_hl  = (news_headline[:80] + "…") if len(news_headline) > 82 else news_headline
+        news_line = f"📰 {short_hl}"
+    else:
+        news_line = None
+
+    # ── Improvement 4: Weekly trend label ─────────────────────────────────────
+    wtu = r.get("weekly_trend_up")
+    if wtu is True:
+        weekly_label = "W↑ (above 20-wk MA)"
+    elif wtu is False:
+        weekly_label = "W↓ (below 20-wk MA)"
+    else:
+        weekly_label = None
+
     # ── Scanner context line (today's move, RVOL, RS vs market) ───────────────
     day_r  = r.get("day_return")
     rvol_v = r.get("rvol")
@@ -679,6 +703,8 @@ def format_telegram_card(r, rank):
     ]
     if context_line:
         card_lines.append(context_line)
+    if weekly_label:
+        card_lines.append(f"Weekly:   {weekly_label}")
     card_lines += [
         f"{ccy} {price:.2f} | {trend_tag} | RSI {r.get('rsi', '-')}",
         f"",
@@ -691,6 +717,10 @@ def format_telegram_card(r, rank):
         f"{sizing_line}",
         f"Momentum: {momentum_display}",
         f"Catalyst: {catalyst}",
+    ]
+    if news_line:
+        card_lines.append(news_line)
+    card_lines += [
         f"{tag}",
         f"─────────────────────────────",
     ]
@@ -1037,7 +1067,7 @@ def build_html_email(top10: list, run_time: str) -> str:
 
     cols = ["#", "TICKER", "TIER", "BIAS", "NOW", "ENTRY",
             "STOP", "T1", "T2", "EXIT", "R/R",
-            "MOMENTUM", "TREND", "CATALYST", "VERDICT"]
+            "MOMENTUM", "DAILY TREND", "WEEKLY", "CATALYST", "VERDICT"]
     header = "".join(f"<th {TH}>{c}</th>" for c in cols)
 
     rows = []
@@ -1049,11 +1079,14 @@ def build_html_email(top10: list, run_time: str) -> str:
         ccy = r.get("currency", "USD")
         sym = _CCY_SYM.get(ccy, f"{ccy} ")
 
-        name      = r.get("name", r.get("ticker", ""))
-        ticker    = r.get("ticker", "")
-        name_disp = (name[:20] + "…") if len(name) > 22 else name
-        ticker_cell = (
-            f'<strong style="font-size:13px;">{ticker}</strong>'
+        name           = r.get("name", r.get("ticker", ""))
+        ticker         = r.get("ticker", "")
+        has_news       = r.get("has_news_today", False)
+        news_headline  = r.get("news_headline", "")
+        name_disp      = (name[:20] + "…") if len(name) > 22 else name
+        news_badge     = ' <span title="News today" style="color:#C55A11;font-size:11px;">📰</span>' if has_news else ""
+        ticker_cell    = (
+            f'<strong style="font-size:13px;">{ticker}{news_badge}</strong>'
             f'<br><span style="font-size:10px;color:#666666;">{name_disp}</span>'
         )
 
@@ -1065,28 +1098,49 @@ def build_html_email(top10: list, run_time: str) -> str:
         ex     = _fp(r.get("recommended_exit"))
         rr_val = r.get("rr_exit")
         rr     = f"{rr_val:.1f}×" if rr_val else "—"
-        cat    = r.get("catalyst_note") or "None"
         mom    = r.get("momentum_st", "NEUTRAL")
         trend  = trend_map.get(r.get("trend_primary", ""), "MA→")
         ct     = r.get("catalyst_tier", "B")
 
+        # ── Weekly trend cell ──
+        wtu = r.get("weekly_trend_up")
+        if wtu is True:
+            weekly_html = '<span style="color:#00B050;font-weight:bold;font-size:14px;" title="Price above 20-week MA">▲ W↑</span>'
+        elif wtu is False:
+            weekly_html = '<span style="color:#C00000;font-weight:bold;font-size:14px;" title="Price below 20-week MA">▼ W↓</span>'
+        else:
+            weekly_html = '<span style="color:#888888;">—</span>'
+
+        # ── Catalyst: show news headline if available ──
+        cat_note = r.get("catalyst_note") or "None"
+        if has_news and news_headline:
+            short_hl = (news_headline[:55] + "…") if len(news_headline) > 57 else news_headline
+            cat_html = (
+                f'{cat_note}'
+                f'<br><span style="font-size:10px;color:#C55A11;font-style:italic;">'
+                f'📰 {short_hl}</span>'
+            )
+        else:
+            cat_html = cat_note
+
         rows.append(
             "<tr>"
-            + td(str(i + 1),           bg)
-            + td(ticker_cell,          bg, align="left")
-            + td(tier_badge(ct),       bg)
-            + td(bias_html(bias),      bg)
-            + td(price,                bg, "font-weight:bold;")
-            + td(entry,                bg)
-            + td(stop,                 bg)
-            + td(t1,                   bg)
-            + td(t2,                   bg)
-            + td(ex,                   bg)
-            + td(rr,                   bg, "font-weight:bold;")
+            + td(str(i + 1),               bg)
+            + td(ticker_cell,              bg, align="left")
+            + td(tier_badge(ct),           bg)
+            + td(bias_html(bias),          bg)
+            + td(price,                    bg, "font-weight:bold;")
+            + td(entry,                    bg)
+            + td(stop,                     bg)
+            + td(t1,                       bg)
+            + td(t2,                       bg)
+            + td(ex,                       bg)
+            + td(rr,                       bg, "font-weight:bold;")
             + td(momentum_html(mom, bias), bg, "font-size:11px;")
-            + td(trend,                bg, "font-size:14px;font-weight:bold;")
-            + td(cat,                  bg, "font-size:11px;")
-            + td(_sv(verdict),         bg, "font-size:11px;font-weight:bold;")
+            + td(trend,                    bg, "font-size:14px;font-weight:bold;")
+            + td(weekly_html,              bg, "text-align:center;")
+            + td(cat_html,                 bg, "font-size:11px;", align="left")
+            + td(_sv(verdict),             bg, "font-size:11px;font-weight:bold;")
             + "</tr>"
         )
 
@@ -1111,7 +1165,9 @@ def build_html_email(top10: list, run_time: str) -> str:
 </table>
 <p style="font-family:Arial,sans-serif;font-size:11px;color:#888888;margin-top:10px;">
   Tier: 🔥 A+ highest conviction &nbsp;|&nbsp; 🔵 A strong &nbsp;|&nbsp; 🟡 B standard<br>
-  Direction: 📈 LONG &nbsp;|&nbsp; 📉 SHORT<br><br>
+  Direction: 📈 LONG &nbsp;|&nbsp; 📉 SHORT<br>
+  Weekly: ▲ W↑ price above 20-week MA (confirmed uptrend) &nbsp;|&nbsp; ▼ W↓ price below 20-week MA (downtrend / caution for longs)<br>
+  📰 = news published in last 24 h<br><br>
   ⚠️ <em>Research only. Not financial advice.</em>
 </p>"""
 
@@ -1286,6 +1342,10 @@ def main():
             "day_return":       r.get("day_return"),
             "rvol":             r.get("rvol"),
             "rs_vs_bench":      r.get("rs_vs_bench"),
+            # Improvements 1 + 4
+            "has_news_today":   r.get("has_news_today", False),
+            "news_headline":    r.get("news_headline", ""),
+            "weekly_trend_up":  r.get("weekly_trend_up"),
         }
         for i, r in enumerate(top10)
     ]
