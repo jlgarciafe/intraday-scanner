@@ -194,7 +194,18 @@ def run_ta_entry(ticker, scanner_data=None):
         "num_shares": None, "risk_pct_used": None,
         # Bias + catalyst tier inherited from scanner
         "bias": "LONG", "catalyst_tier": "B",
+        # Scanner context carried forward for display
+        "rs_vs_bench": None, "day_return": None, "rvol": None,
     }
+
+    # ── Inherit scanner context early — bias is needed before level calculations
+    if scanner_data:
+        result["bias"]          = scanner_data.get("bias", "LONG")
+        result["catalyst_tier"] = scanner_data.get("catalyst_tier", "B")
+        result["rs_vs_bench"]   = scanner_data.get("rs_vs_bench")
+        result["day_return"]    = scanner_data.get("day_return")
+        result["rvol"]          = scanner_data.get("rvol")
+    bias = result["bias"]
 
     try:
         end_dt   = datetime.utcnow()
@@ -260,7 +271,11 @@ def run_ta_entry(ticker, scanner_data=None):
             primary = "MIXED"
 
         secondary   = "UPTREND" if current_price > ma20 else "DOWNTREND"
-        momentum_st = "BULLISH" if (rsi > 55 and hist > 0) else ("BEARISH" if (rsi < 45 and hist < 0) else "NEUTRAL")
+        if bias == "SHORT":
+            # For SHORT: bearish signals confirm direction (desired)
+            momentum_st = "BEARISH" if (rsi < 45 and hist < 0) else ("BULLISH" if (rsi > 55 and hist > 0) else "NEUTRAL")
+        else:
+            momentum_st = "BULLISH" if (rsi > 55 and hist > 0) else ("BEARISH" if (rsi < 45 and hist < 0) else "NEUTRAL")
 
         result["trend_primary"]   = primary
         result["trend_secondary"] = secondary
@@ -272,91 +287,164 @@ def run_ta_entry(ticker, scanner_data=None):
         result["supports"]    = supports
         result["resistances"] = resistances
 
-        nearest_support = supports[0] if supports else current_price * 0.95
-        entry_low  = round(nearest_support * 1.005, 4)
-        entry_high = round(current_price * 1.005, 4)
-        entry_mid  = round((entry_low + entry_high) / 2, 4)
+        if bias == "SHORT":
+            # ── SHORT trade: sell near resistance, stop above, targets below ──
+            nearest_resistance = resistances[0] if resistances else current_price * 1.05
+            entry_high = round(nearest_resistance * 0.995, 4)
+            entry_low  = round(current_price * 0.995, 4)
+            if entry_low > entry_high:
+                entry_low, entry_high = entry_high, entry_low
+            entry_mid  = round((entry_low + entry_high) / 2, 4)
 
-        stop_loss = round(nearest_support - 1.5 * atr, 4)
-        stop_pct  = round((entry_mid - stop_loss) / entry_mid, 4)
+            stop_loss = round(nearest_resistance + 1.5 * atr, 4)
+            stop_pct  = round((stop_loss - entry_mid) / entry_mid, 4)
 
-        if stop_pct < MIN_STOP_PCT:
-            stop_loss = round(entry_mid * (1 - MIN_STOP_PCT), 4)
-            stop_pct  = MIN_STOP_PCT
+            if stop_pct < MIN_STOP_PCT:
+                stop_loss = round(entry_mid * (1 + MIN_STOP_PCT), 4)
+                stop_pct  = MIN_STOP_PCT
+            if stop_pct > MAX_STOP_PCT:
+                result["status"]      = "pass"
+                result["pass_reason"] = f"Short stop {stop_pct:.1%} exceeds 25% max"
+                result["verdict"]     = "PASS"
+                return result
 
-        if stop_pct > MAX_STOP_PCT:
-            result["status"]      = "pass"
-            result["pass_reason"] = f"Stop {stop_pct:.1%} exceeds 25% max -- no clean stop"
-            result["verdict"]     = "PASS"
-            return result
+            result["entry_low"]  = entry_low
+            result["entry_high"] = entry_high
+            result["stop_loss"]  = stop_loss
+            result["stop_pct"]   = round(stop_pct * 100, 2)
 
-        result["entry_low"]  = entry_low
-        result["entry_high"] = entry_high
-        result["stop_loss"]  = stop_loss
-        result["stop_pct"]   = round(stop_pct * 100, 2)
+            risk = stop_loss - entry_mid   # positive distance from entry to stop
 
-        risk = entry_mid - stop_loss
+            # Downside targets — nearest support levels below entry (supports sorted descending)
+            t1 = next((s for s in supports if s < entry_low * 0.99), None)
+            if t1 is None:
+                t1 = round(entry_mid - 1.5 * risk, 4)
+            rr_t1 = round((entry_mid - t1) / risk, 2)
+            if rr_t1 < MIN_RR_T1:
+                result["status"]      = "pass"
+                result["pass_reason"] = f"Short T1 R/R {rr_t1:.2f} below minimum {MIN_RR_T1}"
+                result["verdict"]     = "PASS"
+                return result
 
-        t1    = next((r for r in resistances if r > entry_high), None)
-        if t1 is None:
-            t1 = round(entry_mid + 1.5 * risk, 4)
-        rr_t1 = round((t1 - entry_mid) / risk, 2)
-        if rr_t1 < MIN_RR_T1:
-            result["status"]      = "pass"
-            result["pass_reason"] = f"T1 R/R {rr_t1:.2f} below minimum {MIN_RR_T1}"
-            result["verdict"]     = "PASS"
-            return result
+            t2 = next((s for s in supports if s < t1 * 0.99), None)
+            if t2 is None:
+                t2 = round(entry_mid - 2.5 * risk, 4)
+            rr_t2 = round((entry_mid - t2) / risk, 2)
+            if rr_t2 < MIN_RR_T2:
+                t2    = round(entry_mid - 2.5 * risk, 4)
+                rr_t2 = round((entry_mid - t2) / risk, 2)
 
-        t2    = next((r for r in resistances if r > t1 * 1.01), None)
-        if t2 is None:
-            t2 = round(entry_mid + 2.5 * risk, 4)
-        rr_t2 = round((t2 - entry_mid) / risk, 2)
-        if rr_t2 < MIN_RR_T2:
-            t2    = round(entry_mid + 2.5 * risk, 4)
-            rr_t2 = round((t2 - entry_mid) / risk, 2)
+            exit_price = next((s for s in supports if s < t2 * 0.98), None)
+            if exit_price is None:
+                exit_price = round(entry_mid - 4 * risk, 4)
+            exit_price = max(exit_price, round(result["week52_low"] * 1.05, 4))
+            rr_exit    = round((entry_mid - exit_price) / risk, 2)
 
-        exit_price = next((r for r in resistances if r > t2 * 1.02), None)
-        if exit_price is None:
-            exit_price = round(entry_mid + 4 * risk, 4)
-        exit_price = min(exit_price, round(result["week52_high"] * 0.95, 4))
-        rr_exit    = round((exit_price - entry_mid) / risk, 2)
+            result["target_1"]         = round(t1, 4)
+            result["rr_t1"]            = rr_t1
+            result["target_2"]         = round(t2, 4)
+            result["rr_t2"]            = rr_t2
+            result["recommended_exit"] = round(exit_price, 4)
+            result["rr_exit"]          = rr_exit
 
-        result["target_1"]         = round(t1, 4)
-        result["rr_t1"]            = rr_t1
-        result["target_2"]         = round(t2, 4)
-        result["rr_t2"]            = rr_t2
-        result["recommended_exit"] = round(exit_price, 4)
-        result["rr_exit"]          = rr_exit
+            sizing = compute_position_sizing(entry_mid, stop_loss)
+            if sizing:
+                result["position_size_eur"] = sizing["position_eur"]
+                result["risk_eur"]          = sizing["risk_eur"]
+                result["num_shares"]        = sizing["num_shares"]
+                result["risk_pct_used"]     = sizing["risk_pct_used"]
 
-        # ── Position sizing ────────────────────────────────────────────────────
-        sizing = compute_position_sizing(entry_mid, stop_loss)
-        if sizing:
-            result["position_size_eur"] = sizing["position_eur"]
-            result["risk_eur"]          = sizing["risk_eur"]
-            result["num_shares"]        = sizing["num_shares"]
-            result["risk_pct_used"]     = sizing["risk_pct_used"]
+            # Verdict for SHORT
+            at_support_sh = bool(supports and current_price <= supports[0] * 1.03)
+            if at_support_sh:
+                verdict = f"WAIT FOR BREAKDOWN BELOW {supports[0]:.2f}"
+            elif momentum_st == "BULLISH":
+                verdict = f"WAIT — Counter-trend momentum (RSI {rsi:.0f})"
+            else:
+                verdict = "ENTER SHORT NOW"
 
-        # ── Inherit bias and catalyst tier from scanner output ─────────────────
-        result["bias"]          = scanner_data.get("bias", "LONG")
-        result["catalyst_tier"] = scanner_data.get("catalyst_tier", "B")
-
-        at_support      = current_price <= nearest_support * 1.02
-        near_resistance = bool(resistances and current_price >= resistances[0] * 0.97)
-        at_52w_low      = current_price <= result["week52_low"] * 1.05
-
-        if at_support and momentum_st != "BEARISH" and primary != "DOWNTREND":
-            verdict = "ENTER NOW"
-        elif current_price <= entry_high and primary == "UPTREND":
-            verdict = "ENTER NOW"
-        elif near_resistance:
-            verdict = f"WAIT FOR BREAKOUT ABOVE {resistances[0]:.2f}"
-        elif current_price > entry_high:
-            verdict = f"WAIT FOR DIP TO {entry_low:.2f}"
         else:
-            verdict = "ENTER NOW"
+            # ── LONG trade (original logic — unchanged) ───────────────────────
+            nearest_support = supports[0] if supports else current_price * 0.95
+            entry_low  = round(nearest_support * 1.005, 4)
+            entry_high = round(current_price * 1.005, 4)
+            entry_mid  = round((entry_low + entry_high) / 2, 4)
 
-        if primary == "DOWNTREND" and not at_52w_low:
-            verdict = f"WAIT FOR BREAKOUT ABOVE {ma50:.2f} (50-day MA)"
+            stop_loss = round(nearest_support - 1.5 * atr, 4)
+            stop_pct  = round((entry_mid - stop_loss) / entry_mid, 4)
+
+            if stop_pct < MIN_STOP_PCT:
+                stop_loss = round(entry_mid * (1 - MIN_STOP_PCT), 4)
+                stop_pct  = MIN_STOP_PCT
+
+            if stop_pct > MAX_STOP_PCT:
+                result["status"]      = "pass"
+                result["pass_reason"] = f"Stop {stop_pct:.1%} exceeds 25% max -- no clean stop"
+                result["verdict"]     = "PASS"
+                return result
+
+            result["entry_low"]  = entry_low
+            result["entry_high"] = entry_high
+            result["stop_loss"]  = stop_loss
+            result["stop_pct"]   = round(stop_pct * 100, 2)
+
+            risk = entry_mid - stop_loss
+
+            t1    = next((r for r in resistances if r > entry_high), None)
+            if t1 is None:
+                t1 = round(entry_mid + 1.5 * risk, 4)
+            rr_t1 = round((t1 - entry_mid) / risk, 2)
+            if rr_t1 < MIN_RR_T1:
+                result["status"]      = "pass"
+                result["pass_reason"] = f"T1 R/R {rr_t1:.2f} below minimum {MIN_RR_T1}"
+                result["verdict"]     = "PASS"
+                return result
+
+            t2    = next((r for r in resistances if r > t1 * 1.01), None)
+            if t2 is None:
+                t2 = round(entry_mid + 2.5 * risk, 4)
+            rr_t2 = round((t2 - entry_mid) / risk, 2)
+            if rr_t2 < MIN_RR_T2:
+                t2    = round(entry_mid + 2.5 * risk, 4)
+                rr_t2 = round((t2 - entry_mid) / risk, 2)
+
+            exit_price = next((r for r in resistances if r > t2 * 1.02), None)
+            if exit_price is None:
+                exit_price = round(entry_mid + 4 * risk, 4)
+            exit_price = min(exit_price, round(result["week52_high"] * 0.95, 4))
+            rr_exit    = round((exit_price - entry_mid) / risk, 2)
+
+            result["target_1"]         = round(t1, 4)
+            result["rr_t1"]            = rr_t1
+            result["target_2"]         = round(t2, 4)
+            result["rr_t2"]            = rr_t2
+            result["recommended_exit"] = round(exit_price, 4)
+            result["rr_exit"]          = rr_exit
+
+            sizing = compute_position_sizing(entry_mid, stop_loss)
+            if sizing:
+                result["position_size_eur"] = sizing["position_eur"]
+                result["risk_eur"]          = sizing["risk_eur"]
+                result["num_shares"]        = sizing["num_shares"]
+                result["risk_pct_used"]     = sizing["risk_pct_used"]
+
+            at_support      = current_price <= nearest_support * 1.02
+            near_resistance = bool(resistances and current_price >= resistances[0] * 0.97)
+            at_52w_low      = current_price <= result["week52_low"] * 1.05
+
+            if at_support and momentum_st != "BEARISH" and primary != "DOWNTREND":
+                verdict = "ENTER NOW"
+            elif current_price <= entry_high and primary == "UPTREND":
+                verdict = "ENTER NOW"
+            elif near_resistance:
+                verdict = f"WAIT FOR BREAKOUT ABOVE {resistances[0]:.2f}"
+            elif current_price > entry_high:
+                verdict = f"WAIT FOR DIP TO {entry_low:.2f}"
+            else:
+                verdict = "ENTER NOW"
+
+            if primary == "DOWNTREND" and not at_52w_low:
+                verdict = f"WAIT FOR BREAKOUT ABOVE {ma50:.2f} (50-day MA)"
 
         result["verdict"] = verdict
         result["status"]  = "ok"
@@ -373,23 +461,34 @@ def run_ta_entry(ticker, scanner_data=None):
 
 def rank_by_return_probability(actionable, top_n=TOP_N):
     """
-    Score each actionable setup and return top_n sorted best-first.
+    Rank: tier first (A+ > A > B), then entry quality within each tier.
+    Direction-aware: DOWNTREND is good alignment for SHORT, UPTREND for LONG.
 
-    Score (max 100):
-      Verdict urgency  — ENTER NOW=30, WAIT FOR DIP=20, WAIT FOR BREAKOUT=10
+    Score components (within-tier, max ~100):
+      Verdict urgency  — ENTER NOW=30, WAIT FOR DIP/BREAKDOWN=20, else=10
       R/R quality      — rr_exit up to 6:1 mapped to 0-30 pts
-      Trend alignment  — UPTREND=20, MIXED=10, DOWNTREND=5
-      RSI room to run  — 40-65=20 (optimal), 65-75=15, else=5
+      Trend alignment  — direction-aware: 20 / 10 / 5
+      RSI              — direction-aware: optimal zone=20, edge=15, poor=5
     """
+    tier_priority = {"A+": 300, "A": 200, "B": 100}
+
     def score(r):
+        tier  = tier_priority.get(r.get("catalyst_tier", "B"), 100)
+        bias  = r.get("bias", "LONG")
         v     = r.get("verdict", "")
-        vs    = 30 if v.startswith("ENTER") else (20 if v.startswith("WAIT FOR DIP") else 10)
+        vs    = 30 if v.startswith("ENTER") else (20 if ("DIP" in v or "BREAKDOWN" in v) else 10)
         rr    = min(r.get("rr_exit", 0) / 6.0, 1.0) * 30
         trend = r.get("trend_primary", "")
-        ts    = 20 if trend == "UPTREND" else (10 if trend == "MIXED" else 5)
-        rsi   = r.get("rsi") or 50
-        rs    = 20 if 40 <= rsi <= 65 else (15 if 65 < rsi <= 75 else 5)
-        return vs + rr + ts + rs
+        if bias == "SHORT":
+            ts = 20 if trend == "DOWNTREND" else (10 if trend == "MIXED" else 5)
+        else:
+            ts = 20 if trend == "UPTREND" else (10 if trend == "MIXED" else 5)
+        rsi = r.get("rsi") or 50
+        if bias == "SHORT":
+            rs = 20 if rsi <= 45 else (15 if rsi <= 55 else 5)
+        else:
+            rs = 20 if 40 <= rsi <= 65 else (15 if 65 < rsi <= 75 else 5)
+        return tier + vs + rr + ts + rs
 
     return sorted(actionable, key=score, reverse=True)[:top_n]
 
@@ -405,22 +504,25 @@ def format_best_opportunities_summary(top10: list, total_actionable: int, total_
         f"Ranked by entry quality | {total_actionable} actionable from {total_scanned} scanned",
         f"",
     ]
-    def _short(name, max_len=25):
-        return name if len(name) <= max_len else name[:max_len - 1] + "…"
-
     trend_tag   = lambda t: "MA↑" if t == "UPTREND" else ("MA→" if t == "MIXED" else "MA↓")
-    verdict_tag = lambda v: "✅ ENTER" if v.startswith("ENTER") else ("⏳ DIP" if v.startswith("WAIT FOR DIP") else "⏳ BRKOUT")
-    ct_tag      = lambda c: {"A+": "🔥A+", "A": "🔵A", "B": "🟡B"}.get(c, "🟡B")
-    bias_tag    = lambda b: "📉S" if b == "SHORT" else "📈L"
+    verdict_tag = lambda v: ("🔴 SHORT" if v.startswith("ENTER SHORT") else
+                             ("✅ ENTER"  if v.startswith("ENTER") else
+                              ("⏳ BRKDWN" if "BREAKDOWN" in v else
+                               ("⏳ DIP"    if "DIP" in v else "⏳ WAIT"))))
+    ct_tag  = lambda c: {"A+": "🔥A+", "A": "🔵A", "B": "🟡B"}.get(c, "🟡B")
+    bias_tag = lambda b: "📉 SHORT" if b == "SHORT" else "📈 LONG"
     for i, r in enumerate(top10, 1):
         sym    = r.get("ticker", "?")
-        name   = _short(r.get("name", sym))
         trend  = trend_tag(r.get("trend_primary", ""))
         rsi    = r.get("rsi", "-")
         tag    = verdict_tag(r.get("verdict", ""))
         ct     = ct_tag(r.get("catalyst_tier", "B"))
         bias   = bias_tag(r.get("bias", "LONG"))
-        lines.append(f"{i}. {ct} *{sym}* ({name}) | {bias} | {trend} | RSI {rsi} | {tag}")
+        day_r  = r.get("day_return")
+        rvol_v = r.get("rvol")
+        move   = f" {'🟢' if day_r and day_r > 0 else '🔴'}{day_r:+.1f}%" if day_r is not None else ""
+        vol    = f" RVOL {rvol_v:.1f}x" if rvol_v is not None else ""
+        lines.append(f"{i}. {ct} *{sym}*{move}{vol} | {bias} | {trend} | RSI {rsi} | {tag}")
     lines += ["", "_Detail cards follow_ ↓"]
     return "\n".join(lines)
 
@@ -432,44 +534,92 @@ def format_telegram_card(r, rank):
     price    = r.get("current_price", 0)
     mid      = (r["entry_low"] + r["entry_high"]) / 2
     entry    = f"{r['entry_low']:.2f} - {r['entry_high']:.2f}"
-    stop     = f"{r['stop_loss']:.2f}  (-{r['stop_pct']:.1f}%)"
-    t1_pct   = (r["target_1"] - mid) / mid * 100
-    t2_pct   = (r["target_2"] - mid) / mid * 100
-    ex_pct   = (r["recommended_exit"] - mid) / mid * 100
-    t1       = f"{r['target_1']:.2f}  (+{t1_pct:.1f}%)  R/R {r['rr_t1']:.1f}:1"
-    t2       = f"{r['target_2']:.2f}  (+{t2_pct:.1f}%)  R/R {r['rr_t2']:.1f}:1"
-    ex       = f"{r['recommended_exit']:.2f}  (+{ex_pct:.1f}%)  R/R {r['rr_exit']:.1f}:1"
     verdict  = r.get("verdict", "-")
-    momentum = r.get("momentum_st", "-")
-    catalyst = r.get("catalyst_note") or "No near-term catalyst"
+    bias     = r.get("bias", "LONG")
 
-    if verdict.startswith("ENTER"):
-        tag = "✅ ENTER NOW"
-    elif verdict.startswith("WAIT FOR DIP"):
-        tag = f"⏳ WAIT — DIP  ({verdict})"
+    # ── Direction-aware stop and target display ────────────────────────────────
+    if bias == "SHORT":
+        # Stop is ABOVE entry — loss if price rises past it
+        stop   = f"{r['stop_loss']:.2f}  (+{r['stop_pct']:.1f}% ▲ above entry)"
+        # Targets are BELOW entry — gain when price falls
+        t1_pct = (mid - r["target_1"]) / mid * 100
+        t2_pct = (mid - r["target_2"]) / mid * 100
+        ex_pct = (mid - r["recommended_exit"]) / mid * 100
+        t1     = f"{r['target_1']:.2f}  (-{t1_pct:.1f}% ▼)  R/R {r['rr_t1']:.1f}:1"
+        t2     = f"{r['target_2']:.2f}  (-{t2_pct:.1f}% ▼)  R/R {r['rr_t2']:.1f}:1"
+        ex     = f"{r['recommended_exit']:.2f}  (-{ex_pct:.1f}% ▼)  R/R {r['rr_exit']:.1f}:1"
     else:
-        tag = f"⏳ WAIT — BREAKOUT  ({verdict})"
+        # Stop is BELOW entry — loss if price falls past it
+        stop   = f"{r['stop_loss']:.2f}  (-{r['stop_pct']:.1f}%)"
+        t1_pct = (r["target_1"] - mid) / mid * 100
+        t2_pct = (r["target_2"] - mid) / mid * 100
+        ex_pct = (r["recommended_exit"] - mid) / mid * 100
+        t1     = f"{r['target_1']:.2f}  (+{t1_pct:.1f}%)  R/R {r['rr_t1']:.1f}:1"
+        t2     = f"{r['target_2']:.2f}  (+{t2_pct:.1f}%)  R/R {r['rr_t2']:.1f}:1"
+        ex     = f"{r['recommended_exit']:.2f}  (+{ex_pct:.1f}%)  R/R {r['rr_exit']:.1f}:1"
 
-    trend_tag   = {"UPTREND": "MA↑", "MIXED": "MA→", "DOWNTREND": "MA↓"}.get(r.get("trend_primary", ""), "MA→")
+    # ── Direction-aware verdict tag ────────────────────────────────────────────
+    if verdict.startswith("ENTER SHORT"):
+        tag = "🔴 ENTER SHORT NOW"
+    elif verdict.startswith("ENTER"):
+        tag = "✅ ENTER NOW"
+    elif "BREAKDOWN" in verdict:
+        tag = f"⏳ {verdict}"
+    elif "DIP" in verdict:
+        tag = f"⏳ WAIT — {verdict}"
+    else:
+        tag = f"⏳ {verdict}"
 
-    # Catalyst tier + bias from scanner
-    ct          = r.get("catalyst_tier", "B")
-    ct_label    = {"A+": "🔥A+", "A": "🔵A", "B": "🟡B"}.get(ct, "🟡B")
-    bias        = r.get("bias", "LONG")
-    bias_label  = "📉 SHORT" if bias == "SHORT" else "📈 LONG"
+    # ── Direction-aware momentum label ─────────────────────────────────────────
+    mom = r.get("momentum_st", "-")
+    if bias == "SHORT":
+        if mom == "BEARISH":
+            momentum_display = "BEARISH ✅ (short confirmed — enter)"
+        elif mom == "BULLISH":
+            momentum_display = "BULLISH ⚠️ (counter-trend — wait for turn)"
+        else:
+            momentum_display = "NEUTRAL  (acceptable — proceed with caution)"
+    else:
+        if mom == "BULLISH":
+            momentum_display = "BULLISH ✅ (enter now)"
+        elif mom == "BEARISH":
+            momentum_display = "BEARISH ⚠️ (wait for reversal)"
+        else:
+            momentum_display = "NEUTRAL  (acceptable — watch for confirmation)"
 
-    # Position sizing line
+    trend_tag  = {"UPTREND": "MA↑", "MIXED": "MA→", "DOWNTREND": "MA↓"}.get(r.get("trend_primary", ""), "MA→")
+    ct         = r.get("catalyst_tier", "B")
+    ct_label   = {"A+": "🔥A+", "A": "🔵A", "B": "🟡B"}.get(ct, "🟡B")
+    bias_label = "📉 SHORT" if bias == "SHORT" else "📈 LONG"
+    catalyst   = r.get("catalyst_note") or "No near-term catalyst"
+
+    # ── Scanner context line (today's move, RVOL, RS vs market) ───────────────
+    day_r  = r.get("day_return")
+    rvol_v = r.get("rvol")
+    rs_v   = r.get("rs_vs_bench")
+    ctx    = []
+    if day_r is not None:
+        ctx.append(f"{'🟢' if day_r > 0 else '🔴'}{day_r:+.1f}% today")
+    if rvol_v is not None:
+        ctx.append(f"RVOL {rvol_v:.1f}x")
+    if rs_v is not None:
+        ctx.append(f"RS {rs_v:+.1f}% vs mkt")
+    context_line = "  |  ".join(ctx) if ctx else None
+
+    # ── Position sizing ────────────────────────────────────────────────────────
     pos_eur  = r.get("position_size_eur")
     risk_eur = r.get("risk_eur")
     n_shares = r.get("num_shares")
     risk_pct = r.get("risk_pct_used", RISK_PCT * 100)
-    if pos_eur:
-        sizing_line = f"Size:     €{pos_eur:,.0f}  ({n_shares:,} units)  Risk: €{risk_eur:,.0f} ({risk_pct}%)"
-    else:
-        sizing_line = "Size:     —"
+    sizing_line = (f"Size:     €{pos_eur:,.0f}  ({n_shares:,} units)  Risk: €{risk_eur:,.0f} ({risk_pct}%)"
+                   if pos_eur else "Size:     —")
 
-    return "\n".join([
+    card_lines = [
         f"*#{rank} {ct_label} {sym}* ({name}) — {bias_label}",
+    ]
+    if context_line:
+        card_lines.append(context_line)
+    card_lines += [
         f"{ccy} {price:.2f} | {trend_tag} | RSI {r.get('rsi', '-')}",
         f"",
         f"Entry:    {ccy} {entry}",
@@ -479,11 +629,12 @@ def format_telegram_card(r, rank):
         f"Exit:     {ccy} {ex}",
         f"",
         f"{sizing_line}",
-        f"Momentum: {momentum}",
+        f"Momentum: {momentum_display}",
         f"Catalyst: {catalyst}",
         f"{tag}",
         f"─────────────────────────────",
-    ])
+    ]
+    return "\n".join(card_lines)
 
 
 def format_markdown_row(r):
