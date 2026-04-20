@@ -191,7 +191,10 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          python ta_narrative.py --orders orders.json --out ta_narrative.md
+          python ta_narrative.py \
+            --orders orders.json \
+            --out-ratings ta_ratings.json \
+            --out-narrative ta_narrative.md
 
       - name: Send combined email report
         env:
@@ -199,7 +202,10 @@ jobs:
           EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: |
-          python send_report.py --narrative ta_narrative.md
+          python send_report.py \
+            --orders orders.json \
+            --ratings ta_ratings.json \
+            --narrative ta_narrative.md
 
       - name: Upload TA results artifact
         if: always()
@@ -208,6 +214,7 @@ jobs:
           name: ta-entry-${{ github.run_number }}
           path: |
             orders.json
+            ta_ratings.json
             ta_report.md
             ta_narrative.md
             scan_report_*.xlsx
