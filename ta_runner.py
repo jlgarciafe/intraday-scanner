@@ -53,6 +53,34 @@ DRY_RUN             = os.getenv("DRY_RUN", "false").lower() == "true"
 CAPITAL_EUR = float(os.getenv("CAPITAL_EUR", "250000"))
 RISK_PCT    = float(os.getenv("RISK_PCT",    "0.025"))
 
+# ── FX rate cache (populated lazily, one fetch per unique currency per run) ──
+_FX_CACHE: dict = {}
+
+def get_eur_fx_rate(currency: str) -> float:
+    """
+    Returns units of `currency` per 1 EUR.
+    e.g. EURKRW=X ≈ 1550  →  1 EUR = 1,550 KRW  →  returns 1550.0
+         EURUSD=X ≈ 1.08  →  1 EUR = 1.08 USD   →  returns 1.08
+         EUR itself        →  returns 1.0
+    Falls back to 1.0 on any network error so sizing still runs.
+    """
+    if currency == "EUR":
+        return 1.0
+    if currency in _FX_CACHE:
+        return _FX_CACHE[currency]
+    try:
+        df = yf.download(f"EUR{currency}=X", period="2d", progress=False)
+        if isinstance(df.columns, __import__("pandas").MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if not df.empty and float(df["Close"].iloc[-1]) > 0:
+            rate = float(df["Close"].iloc[-1])
+            _FX_CACHE[currency] = rate
+            return rate
+    except Exception:
+        pass
+    _FX_CACHE[currency] = 1.0
+    return 1.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TECHNICAL INDICATORS
@@ -146,27 +174,38 @@ def find_support_resistance(df, current_price):
 
 def compute_position_sizing(entry_mid: float, stop_loss: float,
                             capital: float = CAPITAL_EUR,
-                            risk_pct: float = RISK_PCT) -> dict:
+                            risk_pct: float = RISK_PCT,
+                            fx_rate: float = 1.0) -> dict:
     """
-    Standard fixed-risk position sizing:
-        risk_eur      = capital × risk_pct
-        num_shares    = risk_eur / (entry - stop)
-        position_eur  = num_shares × entry
+    FX-aware fixed-risk position sizing.
+
+    fx_rate : units of the stock's local currency per 1 EUR
+              e.g. 1550.0 for KRW, 1.08 for USD, 0.85 for GBP, 1.0 for EUR
+
+    Steps:
+        risk_eur       = capital × risk_pct                (in EUR)
+        risk_local     = risk_eur × fx_rate                (converted to local ccy)
+        stop_dist      = |entry - stop|                    (in local ccy)
+        num_shares     = risk_local / stop_dist
+        position_local = num_shares × entry                (in local ccy)
+        position_eur   = position_local / fx_rate          (EUR equivalent)
 
     Returns a sizing dict, or None if stop_distance is invalid.
-    Works for both LONG (entry > stop) — SHORT handled by abs().
     """
     risk_eur      = capital * risk_pct
+    risk_local    = risk_eur * fx_rate
     stop_distance = abs(entry_mid - stop_loss)
     if stop_distance <= 0:
         return None
-    num_shares   = risk_eur / stop_distance
-    position_eur = num_shares * entry_mid
+    num_shares     = risk_local / stop_distance
+    position_local = num_shares * entry_mid
+    position_eur   = position_local / fx_rate
     return {
-        "risk_eur":      round(risk_eur),
-        "position_eur":  round(position_eur),
-        "num_shares":    int(round(num_shares)),
-        "risk_pct_used": round(risk_pct * 100, 1),
+        "risk_eur":       round(risk_eur),
+        "position_eur":   round(position_eur),
+        "position_local": round(position_local),
+        "num_shares":     int(round(num_shares)),
+        "risk_pct_used":  round(risk_pct * 100, 1),
     }
 
 
@@ -189,9 +228,9 @@ def run_ta_entry(ticker, scanner_data=None):
         "week52_high": None, "week52_low": None,
         "atr": None, "supports": [], "resistances": [],
         "catalyst_note": None, "pass_reason": None,
-        # Position sizing (added — compute_position_sizing)
-        "position_size_eur": None, "risk_eur": None,
-        "num_shares": None, "risk_pct_used": None,
+        # Position sizing
+        "position_size_eur": None, "position_size_local": None,
+        "risk_eur": None, "num_shares": None, "risk_pct_used": None,
         # Bias + catalyst tier inherited from scanner
         "bias": "LONG", "catalyst_tier": "B",
         # Scanner context carried forward for display
@@ -238,6 +277,9 @@ def run_ta_entry(ticker, scanner_data=None):
                 result["catalyst_note"] = f"Earnings: {ed}"
         except Exception:
             pass
+
+        # Fetch FX rate once per currency (cached) — needed for local-currency sizing
+        fx_rate = get_eur_fx_rate(result["currency"])
 
         df["MA20"]  = df["Close"].rolling(20).mean()
         df["MA50"]  = df["Close"].rolling(50).mean()
@@ -351,12 +393,13 @@ def run_ta_entry(ticker, scanner_data=None):
             result["recommended_exit"] = round(exit_price, 4)
             result["rr_exit"]          = rr_exit
 
-            sizing = compute_position_sizing(entry_mid, stop_loss)
+            sizing = compute_position_sizing(entry_mid, stop_loss, fx_rate=fx_rate)
             if sizing:
-                result["position_size_eur"] = sizing["position_eur"]
-                result["risk_eur"]          = sizing["risk_eur"]
-                result["num_shares"]        = sizing["num_shares"]
-                result["risk_pct_used"]     = sizing["risk_pct_used"]
+                result["position_size_eur"]   = sizing["position_eur"]
+                result["position_size_local"] = sizing["position_local"]
+                result["risk_eur"]            = sizing["risk_eur"]
+                result["num_shares"]          = sizing["num_shares"]
+                result["risk_pct_used"]       = sizing["risk_pct_used"]
 
             # Verdict for SHORT
             at_support_sh = bool(supports and current_price <= supports[0] * 1.03)
@@ -429,12 +472,13 @@ def run_ta_entry(ticker, scanner_data=None):
             result["recommended_exit"] = round(exit_price, 4)
             result["rr_exit"]          = rr_exit
 
-            sizing = compute_position_sizing(entry_mid, stop_loss)
+            sizing = compute_position_sizing(entry_mid, stop_loss, fx_rate=fx_rate)
             if sizing:
-                result["position_size_eur"] = sizing["position_eur"]
-                result["risk_eur"]          = sizing["risk_eur"]
-                result["num_shares"]        = sizing["num_shares"]
-                result["risk_pct_used"]     = sizing["risk_pct_used"]
+                result["position_size_eur"]   = sizing["position_eur"]
+                result["position_size_local"] = sizing["position_local"]
+                result["risk_eur"]            = sizing["risk_eur"]
+                result["num_shares"]          = sizing["num_shares"]
+                result["risk_pct_used"]       = sizing["risk_pct_used"]
 
             at_support      = current_price <= nearest_support * 1.02
             near_resistance = bool(resistances and current_price >= resistances[0] * 0.97)
@@ -615,12 +659,19 @@ def format_telegram_card(r, rank):
     context_line = "  |  ".join(ctx) if ctx else None
 
     # ── Position sizing ────────────────────────────────────────────────────────
-    pos_eur  = r.get("position_size_eur")
-    risk_eur = r.get("risk_eur")
-    n_shares = r.get("num_shares")
-    risk_pct = r.get("risk_pct_used", RISK_PCT * 100)
-    sizing_line = (f"Size:     €{pos_eur:,.0f}  ({n_shares:,} units)  Risk: €{risk_eur:,.0f} ({risk_pct}%)"
-                   if pos_eur else "Size:     —")
+    pos_eur   = r.get("position_size_eur")
+    pos_local = r.get("position_size_local")
+    risk_eur  = r.get("risk_eur")
+    n_shares  = r.get("num_shares")
+    risk_pct  = r.get("risk_pct_used", RISK_PCT * 100)
+    if pos_local is not None and n_shares is not None:
+        if ccy == "EUR":
+            sizing_line = f"Size:     €{pos_local:,.0f}  ({n_shares:,} units)  Risk: €{risk_eur:,.0f} ({risk_pct}%)"
+        else:
+            sizing_line = (f"Size:     {ccy} {pos_local:,.0f}  ({n_shares:,} units)"
+                           f"  ≈ €{pos_eur:,.0f}  Risk: €{risk_eur:,.0f} ({risk_pct}%)")
+    else:
+        sizing_line = "Size:     —"
 
     card_lines = [
         f"*#{rank} {ct_label} {sym}* ({name}) — {bias_label}",
@@ -831,7 +882,7 @@ def generate_excel_report(all_candidates: list, top10: list,
           "T1 Price", "T1 R/R",
           "T2 Price", "T2 R/R",
           "Exit Price", "Exit R/R",
-          "Position Size €", "Units", "Risk €", "Risk %",
+          "Position Size (local ccy)", "Units", "Risk €", "Risk %",
           "RSI", "MA Trend", "Momentum", "Catalyst", "Verdict"]
     hdr(ws3, h3)
 
@@ -855,7 +906,7 @@ def generate_excel_report(all_candidates: list, top10: list,
                r.get("rr_t2"),
                r.get("recommended_exit"),
                r.get("rr_exit"),
-               r.get("position_size_eur"),
+               r.get("position_size_local"),
                r.get("num_shares"),
                r.get("risk_eur"),
                r.get("risk_pct_used"),
