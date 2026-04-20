@@ -693,6 +693,276 @@ def send_telegram(text):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EXCEL REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_excel_report(all_candidates: list, top10: list,
+                          filepath: str = "scan_report.xlsx") -> str:
+    """
+    Build a 3-sheet Excel workbook:
+      Sheet 1 — TOP MOVERS    : all scanner candidates, sorted by score
+      Sheet 2 — TOP OPPORTUNITIES : ranked top-10 from TA runner
+      Sheet 3 — DETAIL CARDS  : full TA analysis (entry / stop / T1 / T2 / exit / sizing)
+    Returns the filepath written.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.utils import get_column_letter
+
+    # ── Colour palette ────────────────────────────────────────────────────────
+    HDR_FILL  = PatternFill("solid", fgColor="1F3864")   # dark navy header
+    HDR_FONT  = Font(color="FFFFFF", bold=True, size=10)
+    AP_FILL   = PatternFill("solid", fgColor="C55A11")   # burnt orange  A+
+    A_FILL    = PatternFill("solid", fgColor="2E75B6")   # blue          A
+    B_FILL    = PatternFill("solid", fgColor="FFC000")   # amber         B
+    LONG_CLR  = Font(color="00B050", bold=True)          # green  LONG
+    SHORT_CLR = Font(color="C00000", bold=True)          # red    SHORT
+    OK_FILL   = PatternFill("solid", fgColor="E2EFDA")   # light green row (ENTER)
+    ALT_FILL  = PatternFill("solid", fgColor="F2F2F2")   # light grey alternate rows
+
+    def hdr(ws, headers):
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.fill = HDR_FILL
+            c.font = HDR_FONT
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.row_dimensions[1].height = 30
+
+    def auto_width(ws, headers, min_w=12, max_w=28):
+        for col in range(1, len(headers) + 1):
+            ws.column_dimensions[get_column_letter(col)].width = min(
+                max_w, max(min_w, len(headers[col - 1]) + 2))
+
+    def tier_colour(cell, ct):
+        if ct == "A+":
+            cell.fill = AP_FILL
+            cell.font = Font(bold=True, color="FFFFFF")
+        elif ct == "A":
+            cell.fill = A_FILL
+            cell.font = Font(bold=True, color="FFFFFF")
+        else:
+            cell.fill = B_FILL
+            cell.font = Font(bold=True)
+
+    def bias_colour(cell, bias):
+        cell.font = SHORT_CLR if bias == "SHORT" else LONG_CLR
+
+    wb = Workbook()
+
+    # ── Sheet 1 : TOP MOVERS ─────────────────────────────────────────────────
+    ws1       = wb.active
+    ws1.title = "TOP MOVERS"
+    h1 = ["Rank", "Ticker", "Name", "Type", "Catalyst Tier", "Bias",
+          "Move %", "RS vs Mkt %", "MA Align", "ATR %", "RVOL", "Score",
+          "Earnings", "Repeat Days", "Trend"]
+    hdr(ws1, h1)
+
+    # Build a name lookup from top10 (ta_runner fetches names from yfinance)
+    name_map = {r.get("ticker"): r.get("name", r.get("ticker", "")) for r in top10}
+
+    sorted_cands = sorted(all_candidates, key=lambda x: x.get("score", 0), reverse=True)
+    for ri, c in enumerate(sorted_cands, 2):
+        tier_lbl = {"etf": "ETF", "future": "FUT", "stock": "STK"}.get(c.get("tier", "stock"), "STK")
+        ct   = c.get("catalyst_tier", "B")
+        bias = c.get("bias", "LONG")
+        row  = [ri - 1,
+                c.get("ticker", ""),
+                name_map.get(c.get("ticker", ""), c.get("ticker", "")),
+                tier_lbl, ct, bias,
+                round(c.get("day_return", 0) or 0, 2),
+                round(c.get("rs_vs_bench", 0) or 0, 2),
+                c.get("ma_align", ""),
+                round(c.get("atr_pct", 0) or 0, 2),
+                round(c.get("rvol", 0) or 0, 2),
+                round(c.get("score", 0) or 0, 0),
+                "Yes" if c.get("earnings_soon") else "No",
+                c.get("repeat_days", 0),
+                c.get("score_trend", "")]
+        bg = ALT_FILL if ri % 2 == 0 else None
+        for col, val in enumerate(row, 1):
+            cell = ws1.cell(row=ri, column=col, value=val)
+            cell.alignment = Alignment(horizontal="center")
+            if bg:
+                cell.fill = bg
+        tier_colour(ws1.cell(row=ri, column=5), ct)
+        bias_colour(ws1.cell(row=ri, column=6), bias)
+
+    ws1.freeze_panes = "A2"
+    auto_width(ws1, h1)
+
+    # ── Sheet 2 : TOP OPPORTUNITIES ──────────────────────────────────────────
+    ws2       = wb.create_sheet("TOP OPPORTUNITIES")
+    h2 = ["Rank", "Ticker", "Name", "Catalyst Tier", "Bias",
+          "Today Move %", "RVOL", "MA Align", "RSI", "Trend", "Verdict"]
+    hdr(ws2, h2)
+
+    trend_lbl = {"UPTREND": "MA↑", "MIXED": "MA→", "DOWNTREND": "MA↓"}
+    for ri, r in enumerate(top10, 2):
+        ct   = r.get("catalyst_tier", "B")
+        bias = r.get("bias", "LONG")
+        verdict = r.get("verdict", "")
+        row = [ri - 1,
+               r.get("ticker", ""),
+               r.get("name", r.get("ticker", "")),
+               ct, bias,
+               round(r.get("day_return") or 0, 2),
+               round(r.get("rvol") or 0, 2),
+               trend_lbl.get(r.get("trend_primary", ""), "MA→"),
+               r.get("rsi", ""),
+               r.get("trend_primary", ""),
+               verdict]
+        row_fill = OK_FILL if verdict.startswith("ENTER") else (ALT_FILL if ri % 2 == 0 else None)
+        for col, val in enumerate(row, 1):
+            cell = ws2.cell(row=ri, column=col, value=val)
+            cell.alignment = Alignment(horizontal="center")
+            if row_fill:
+                cell.fill = row_fill
+        tier_colour(ws2.cell(row=ri, column=4), ct)
+        bias_colour(ws2.cell(row=ri, column=5), bias)
+
+    ws2.freeze_panes = "A2"
+    auto_width(ws2, h2)
+
+    # ── Sheet 3 : DETAIL CARDS ───────────────────────────────────────────────
+    ws3       = wb.create_sheet("DETAIL CARDS")
+    h3 = ["Rank", "Ticker", "Name", "Catalyst Tier", "Bias", "Currency",
+          "Current Price", "Entry Low", "Entry High",
+          "Stop Loss", "Stop %",
+          "T1 Price", "T1 R/R",
+          "T2 Price", "T2 R/R",
+          "Exit Price", "Exit R/R",
+          "Position Size €", "Units", "Risk €", "Risk %",
+          "RSI", "MA Trend", "Momentum", "Catalyst", "Verdict"]
+    hdr(ws3, h3)
+
+    for ri, r in enumerate(top10, 2):
+        ct      = r.get("catalyst_tier", "B")
+        bias    = r.get("bias", "LONG")
+        verdict = r.get("verdict", "")
+        row = [ri - 1,
+               r.get("ticker", ""),
+               r.get("name", r.get("ticker", "")),
+               ct, bias,
+               r.get("currency", "USD"),
+               r.get("current_price"),
+               r.get("entry_low"),
+               r.get("entry_high"),
+               r.get("stop_loss"),
+               r.get("stop_pct"),
+               r.get("target_1"),
+               r.get("rr_t1"),
+               r.get("target_2"),
+               r.get("rr_t2"),
+               r.get("recommended_exit"),
+               r.get("rr_exit"),
+               r.get("position_size_eur"),
+               r.get("num_shares"),
+               r.get("risk_eur"),
+               r.get("risk_pct_used"),
+               r.get("rsi"),
+               trend_lbl.get(r.get("trend_primary", ""), "MA→"),
+               r.get("momentum_st", ""),
+               r.get("catalyst_note") or "No near-term catalyst",
+               verdict]
+        row_fill = OK_FILL if verdict.startswith("ENTER") else (ALT_FILL if ri % 2 == 0 else None)
+        for col, val in enumerate(row, 1):
+            cell = ws3.cell(row=ri, column=col, value=val)
+            cell.alignment = Alignment(horizontal="center")
+            if row_fill:
+                cell.fill = row_fill
+            # Number formats
+            if col in (7, 8, 9, 10, 12, 14, 16):   # prices
+                cell.number_format = "#,##0.00"
+            elif col in (11, 13, 15, 17, 21):       # %  and R/R
+                cell.number_format = "0.00"
+            elif col in (18, 20):                   # euro amounts
+                cell.number_format = "#,##0"
+            elif col == 19:                         # units
+                cell.number_format = "#,##0"
+        tier_colour(ws3.cell(row=ri, column=4), ct)
+        bias_colour(ws3.cell(row=ri, column=5), bias)
+        # Green/red verdict cell
+        vc = ws3.cell(row=ri, column=26)
+        if verdict.startswith("ENTER SHORT"):
+            vc.fill = PatternFill("solid", fgColor="C00000")
+            vc.font = Font(bold=True, color="FFFFFF")
+        elif verdict.startswith("ENTER"):
+            vc.fill = PatternFill("solid", fgColor="00B050")
+            vc.font = Font(bold=True, color="FFFFFF")
+
+    ws3.freeze_panes = "A2"
+    auto_width(ws3, h3, min_w=13, max_w=22)
+
+    wb.save(filepath)
+    return filepath
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_email_report(filepath: str, subject_suffix: str = "") -> bool:
+    """
+    Email the Excel report as an attachment via SMTP.
+    Required env vars: EMAIL_TO, EMAIL_FROM, EMAIL_PASSWORD
+    Optional:          SMTP_HOST (default smtp.gmail.com), SMTP_PORT (default 587)
+    """
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base      import MIMEBase
+    from email.mime.text      import MIMEText
+    from email                import encoders
+
+    email_to   = os.getenv("EMAIL_TO",       "")
+    email_from = os.getenv("EMAIL_FROM",     "")
+    email_pass = os.getenv("EMAIL_PASSWORD", "")
+    smtp_host  = os.getenv("SMTP_HOST",      "smtp.gmail.com")
+    smtp_port  = int(os.getenv("SMTP_PORT",  "587"))
+
+    if not email_to or not email_from or not email_pass:
+        print("WARN: EMAIL_TO / EMAIL_FROM / EMAIL_PASSWORD not set — skipping email")
+        return False
+
+    msg            = MIMEMultipart()
+    msg["From"]    = email_from
+    msg["To"]      = email_to
+    msg["Subject"] = f"Intraday Scanner Report — {subject_suffix}"
+
+    body = (
+        f"Intraday Scanner — {subject_suffix}\n\n"
+        f"Excel report attached (3 sheets):\n"
+        f"  1. TOP MOVERS         — all qualifying candidates ranked by score\n"
+        f"  2. TOP OPPORTUNITIES  — top 10 ranked by entry quality (A+ first)\n"
+        f"  3. DETAIL CARDS       — full TA: entry zone / stop / T1 / T2 / exit / sizing\n\n"
+        f"Tier legend:  🔥 A+ = highest conviction  |  🔵 A = strong  |  🟡 B = standard\n"
+        f"Direction:    LONG = buy & hold up  |  SHORT = sell & profit on fall\n\n"
+        f"⚠️  Research only. Not financial advice.\n"
+    )
+    msg.attach(MIMEText(body, "plain"))
+
+    with open(filepath, "rb") as fh:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(fh.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition",
+                    f'attachment; filename="{os.path.basename(filepath)}"')
+    msg.attach(part)
+
+    try:
+        srv = smtplib.SMTP(smtp_host, smtp_port)
+        srv.ehlo()
+        srv.starttls()
+        srv.login(email_from, email_pass)
+        srv.sendmail(email_from, email_to, msg.as_string())
+        srv.quit()
+        print(f"Email report sent → {email_to}")
+        return True
+    except Exception as e:
+        print(f"ERROR sending email: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -802,6 +1072,17 @@ def main():
             f"🎯 *BEST OPPORTUNITIES — {now_str}*\n"
             f"0 actionable setups from {len(tickers)} scanned."
         )
+
+    # ── Excel report + email ──────────────────────────────────────────────────
+    xl_path = f"scan_report_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.xlsx"
+    try:
+        generate_excel_report(scan_data, top10, filepath=xl_path)
+        print(f"Excel report written: {xl_path}")
+        send_email_report(xl_path, subject_suffix=now_str)
+    except ImportError:
+        print("WARN: openpyxl not installed — skipping Excel report")
+    except Exception as e:
+        print(f"ERROR generating Excel report: {e}")
 
     print(f"\n{'='*60}")
     print(f"Done. {len(actionable)}/{len(tickers)} actionable. Top {len(top10)} sent to Telegram.")
