@@ -1406,7 +1406,8 @@ def send_email_report(top10: list, filepath: str, run_time: str) -> bool:
         srv.ehlo()
         srv.starttls()
         srv.login(email_from, email_pass)
-        srv.sendmail(email_from, email_to, msg.as_string())
+        recipients = [r.strip() for r in email_to.split(",") if r.strip()]
+        srv.sendmail(email_from, recipients, msg.as_string())
         srv.quit()
         print(f"HTML email sent → {email_to}")
         return True
