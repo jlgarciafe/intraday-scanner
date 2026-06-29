@@ -29,9 +29,9 @@ on:
         default: "all"
         type: string
       min_move_pct:
-        description: "Minimum move % to qualify a ticker (default 3.0)"
+        description: "Minimum move % to qualify a ticker (default 4.0)"
         required: false
-        default: "3.0"
+        default: "4.0"
         type: string
       skip_ta:
         description: "Skip TA entry runner (scan only)"
@@ -113,7 +113,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           MARKET_CONTEXT:     ${{ steps.market_context.outputs.market }}
-          MIN_MOVE_PCT:       ${{ github.event.inputs.min_move_pct || '3.0' }}
+          MIN_MOVE_PCT:       ${{ github.event.inputs.min_move_pct || '4.0' }}
           DRY_RUN:            ${{ github.event.inputs.dry_run || 'false' }}
           OUTPUT_JSON:        "scan_results.json"
           HISTORY_FILE:       "scan_history.json"
